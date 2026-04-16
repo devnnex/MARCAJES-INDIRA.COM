@@ -1,8 +1,30 @@
+html{
+ height:100%;
+ -webkit-text-size-adjust:100%;
+ text-size-adjust:100%;
+ -webkit-font-smoothing:antialiased;
+ -moz-osx-font-smoothing:grayscale;
+ text-rendering:optimizeLegibility;
+}
+
 body{
  margin:0;
- font-family:Segoe UI;
+ min-height:100%;
+ font-family:
+  "SF Pro Text",
+  "SF Pro Display",
+  -apple-system,
+  BlinkMacSystemFont,
+  "Segoe UI",
+  Roboto,
+  "Helvetica Neue",
+  Arial,
+  "Noto Sans",
+  "Liberation Sans",
+  sans-serif;
  background:linear-gradient(120deg,#eef2f7,#e9ecf5);
  color:#1d1d1d;
+ font-kerning:normal;
 }
 
 *{
@@ -22,6 +44,7 @@ body{
 .app{
  display:flex;
  height:100vh;
+ min-height:100dvh;
 }
 
 /* SIDEBAR */
@@ -383,6 +406,12 @@ select,
 button,
 input{
  font:inherit;
+}
+
+input,
+select,
+textarea{
+ font-size:16px;
 }
 
 /* WORKER CARDS */
@@ -1110,7 +1139,7 @@ input{
  .app{
   flex-direction:column;
   height:auto;
-  min-height:100vh;
+  min-height:100dvh;
  }
 
  .sidebar{
@@ -1382,7 +1411,7 @@ input{
 
 @media (min-width: 769px) and (max-width: 1024px){
  .app{
-  min-height:100vh;
+  min-height:100dvh;
  }
 
  .sidebar{
@@ -1416,5 +1445,24 @@ input{
 
  .form-grid{
   grid-template-columns:repeat(2,minmax(0,1fr));
+ }
+}
+
+@supports (-webkit-touch-callout:none){
+ html{
+  height:-webkit-fill-available;
+ }
+
+ body{
+  min-height:-webkit-fill-available;
+  padding:
+   env(safe-area-inset-top)
+   env(safe-area-inset-right)
+   env(safe-area-inset-bottom)
+   env(safe-area-inset-left);
+ }
+
+ .app{
+  min-height:-webkit-fill-available;
  }
 }
