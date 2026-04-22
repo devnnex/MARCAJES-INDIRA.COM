@@ -32,6 +32,7 @@
     <h2>Vikingos</h2>
     <nav>
       <button class="nav-btn" data-section="dashboard" onclick="showSection('dashboard')">Dashboard</button>
+      <button class="nav-btn" data-section="history" onclick="showSection('history')">Historial</button>
       <button class="nav-btn" data-section="workers" onclick="showSection('workers')">Trabajadores</button>
       <button class="nav-btn active" data-section="time" onclick="showSection('time')">Marcajes</button>
       <!-- <button class="nav-btn" data-section="liquidations" onclick="showSection('liquidations')">Liquidaciones</button>
@@ -194,8 +195,75 @@
     </section>
 
     <section id="history" class="section">
-      <h2>Historial</h2>
-      <table id="historyTable"></table>
+      <div class="history-panel">
+        <div class="history-header">
+          <div>
+            <span class="section-eyebrow">Pagos realizados</span>
+            <h2>Historial de liquidaciones</h2>
+            <p class="section-copy" id="historyCaption">Consulta las liquidaciones registradas y filtra por trabajador cuando tengas multiples pagos.</p>
+          </div>
+          <button class="refresh-workers-btn" type="button" onclick="refreshLiquidationsHistory()">
+            <span class="refresh-icon" aria-hidden="true">&#8635;</span>
+            <span>Refrescar historial</span>
+          </button>
+        </div>
+
+        <div class="history-controls">
+          <div class="history-filters">
+            <label class="select-shell">
+              <span>Filtrar por trabajador</span>
+              <select id="historyWorkerFilter">
+                <option value="all">Todos los trabajadores</option>
+              </select>
+            </label>
+
+            <label class="select-shell">
+              <span>Ir a fecha detectada</span>
+              <select id="historyDateFilter">
+                <option value="all">Todas las fechas</option>
+              </select>
+            </label>
+
+            <label class="select-shell">
+              <span>Buscar fecha</span>
+              <input id="historyDateSearch" list="historyDateSuggestions" placeholder="Ej: 21 abr 2026 o vie 21 abr 2026">
+              <datalist id="historyDateSuggestions"></datalist>
+            </label>
+          </div>
+
+          <div class="history-kpis">
+            <div class="history-kpi">
+              <span>Pagos realizados</span>
+              <strong id="historyTotalRecords">0</strong>
+            </div>
+            <div class="history-kpi">
+              <span>Total pagado</span>
+              <strong id="historyTotalAmount">$0</strong>
+            </div>
+          </div>
+        </div>
+
+        <div class="time-table-card">
+          <div class="time-table-wrapper">
+            <div id="historyLoader" class="time-loader" aria-hidden="true">
+              <div class="loader-spinner"></div>
+              <span>Cargando historial de liquidaciones...</span>
+            </div>
+
+            <table class="time-table">
+              <thead>
+                <tr>
+                  <th>Trabajador</th>
+                  <th>Fecha de pago</th>
+                  <th>Horas pagadas</th>
+                  <th>Valor pagado</th>
+                </tr>
+              </thead>
+              <tbody id="historyTableBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
     </section>
 
   </main>
@@ -212,6 +280,11 @@
 
 <!--JS AND SWEET ALERT-->
 <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+<script src="https://cdn.jsdelivr.net/npm/emailjs-com@3/dist/email.min.js"></script>
+
+<script>
+  emailjs.init("4JF4bFdYqWgGdPOue");
+</script>
 <script src="app.js"></script>
 </body>
 </html>
