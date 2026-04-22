@@ -1,4 +1,4 @@
-const API = "https://script.google.com/macros/s/AKfycbya9lfXYzFxuv7NdESWlL-jz1Lwmjq4wWr4z-ZYncEbCCzY6SYTYj9DIvlQqp23q-dr/exec";
+const API = "https://script.google.com/macros/s/AKfycbwNUBe8KUQoNaQi0jHWnlonqhA1uTEv_4HDnBMpNfAwY24sRzL8K49s-74T25Eka4yX/exec";
 
 const COP = new Intl.NumberFormat("es-CO", {
   style: "currency",
@@ -31,9 +31,10 @@ let currentWorkers = [];
 let attendanceMode = "single";
 let selectedBatchWorkers = new Set();
 let adminUnlocked = false;
+let liquidationHistory = [];
 
 const ADMIN_PIN = "5678";
-const PROTECTED_SECTIONS = new Set(["dashboard", "workers"]);
+const PROTECTED_SECTIONS = new Set(["dashboard", "workers", "history"]);
 
 function formatCOP(value){
   const numericValue = Number(value);
@@ -221,7 +222,7 @@ function toggleRateBoxVisibility(sectionId){
     return;
   }
 
-  rateBox.classList.toggle("hidden-by-section", sectionId === "time");
+  rateBox.classList.toggle("hidden-by-section", sectionId === "time" || sectionId === "history");
 }
 
 function setActiveSectionUI(id){
@@ -305,8 +306,7 @@ async function showSection(id){
     if (!hasAccess){
       if (id !== "time"){
         setActiveSectionUI("time");
-        await loadWorkers();
-        await loadTimeLogs({ showLoader: false });
+        await loadTimeSection();
       }
       return;
     }
@@ -323,8 +323,31 @@ async function showSection(id){
   }
 
   if (id === "time"){
+    await loadTimeSection();
+  }
+
+  if (id === "history"){
+    await Promise.allSettled([
+      loadLiquidationsHistory({ showLoader: true }),
+      loadWorkers()
+    ]);
+    populateLiquidationWorkerFilter(liquidationHistory);
+    renderLiquidationsHistory();
+  }
+}
+
+async function loadTimeSection(){
+  setGlobalLoader(true, {
+    title: "Cargando marcajes",
+    text: "Estamos preparando la vista para consultar los registros."
+  });
+
+  try {
     await loadWorkers();
-    await loadTimeLogs({ showLoader: false });
+    await loadTimeLogs({ showLoader: true });
+  } catch (error){
+    setGlobalLoader(false);
+    throw error;
   }
 }
 
@@ -409,6 +432,7 @@ function renderWorkers(workers = currentWorkers){
     const maxHours = 48;
     const progress = Math.min((worker.hours / maxHours) * 100, 100);
     const money = formatCOP(worker.pay || 0);
+    const safeWorkerName = escapeHTML(worker.name || "Sin nombre");
     const liqDate = worker.lastLiquidation
       ? new Date(worker.lastLiquidation).toLocaleDateString("es-CO", {
           weekday: "short",
@@ -429,7 +453,10 @@ function renderWorkers(workers = currentWorkers){
     return `
       <div class="worker-card">
         <div class="worker-header">
-          <span>${worker.name}</span>
+          <div class="worker-name-row">
+            <span class="worker-name">${safeWorkerName}</span>
+            <button class="edit-worker-btn" type="button" onclick="editWorker('${worker.id}')" aria-label="Editar trabajador">&#9998;</button>
+          </div>
           <span>${money}</span>
         </div>
 
@@ -564,9 +591,20 @@ async function deleteWorker(id){
 }
 
 async function editWorker(id, currentName, currentPhone, currentEmail){
-  const safeName = escapeHTML(currentName || "");
-  const safePhone = escapeHTML(currentPhone || "");
-  const safeEmail = escapeHTML(currentEmail || "");
+  const workerId = String(id || "").trim();
+  if (!workerId){
+    showPremiumModal({
+      icon: "warning",
+      title: "Trabajador no valido",
+      text: "No se pudo identificar el trabajador a editar."
+    });
+    return;
+  }
+
+  const workerData = currentWorkers.find(worker => String(worker.id) === workerId) || {};
+  const safeName = escapeHTML(currentName ?? workerData.name ?? "");
+  const safePhone = escapeHTML(currentPhone ?? workerData.phone ?? "");
+  const safeEmail = escapeHTML(currentEmail ?? workerData.email ?? "");
 
   const { isConfirmed, value } = await showPremiumModal({
     title: "Editar trabajador",
@@ -612,16 +650,31 @@ async function editWorker(id, currentName, currentPhone, currentEmail){
     return;
   }
 
-  await api("updateWorker", {
-    id,
-    name: value.name,
-    phone: value.phone,
-    email: value.email
+  setGlobalLoader(true, {
+    title: "Guardando cambios",
+    text: "Estamos actualizando la informacion del trabajador."
   });
 
-  loadWorkers();
+  try {
+    await api("updateWorker", {
+      id: workerId,
+      name: value.name,
+      phone: value.phone,
+      email: value.email
+    });
 
-  showPremiumModal({
+    await loadWorkers();
+    if (workerSelect.value && String(workerSelect.value) === workerId){
+      await loadTimeLogs({ showLoader: false });
+    }
+    if (adminUnlocked){
+      await loadDashboard();
+    }
+  } finally {
+    setGlobalLoader(false);
+  }
+
+  await showPremiumModal({
     icon: "success",
     title: "Cambios guardados",
     text: `${value.name} fue actualizado correctamente.`
@@ -652,6 +705,72 @@ function formatAttendanceTime(rawTime){
     hour: "2-digit",
     minute: "2-digit"
   });
+}
+
+function formatLiquidationDate(rawDate){
+  const date = new Date(rawDate);
+  if (Number.isNaN(date.getTime())){
+    return "Fecha no disponible";
+  }
+
+  const datePart = date
+    .toLocaleDateString("es-CO", {
+      weekday: "short",
+      day: "numeric",
+      month: "short",
+      year: "numeric"
+    })
+    .replace(/,/g, "")
+    .replace(/\./g, "");
+
+  const timePart = date.toLocaleTimeString("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true
+  });
+
+  return `${datePart} ${timePart}`;
+}
+
+function normalizeSearchText(value){
+  return String(value ?? "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim();
+}
+
+function getLiquidationDate(rawDate){
+  const date = new Date(rawDate);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function getLiquidationDayKey(rawDate){
+  const date = getLiquidationDate(rawDate);
+  if (!date){
+    return "";
+  }
+
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function formatLiquidationDayLabel(rawDate){
+  const date = getLiquidationDate(rawDate);
+  if (!date){
+    return "Fecha no disponible";
+  }
+
+  return date.toLocaleDateString("es-CO", {
+    weekday: "short",
+    day: "numeric",
+    month: "short",
+    year: "numeric"
+  })
+  .replace(/,/g, "")
+  .replace(/\./g, "");
 }
 
 function buildBatchAttendanceRows(results, maxRows = 8){
@@ -877,9 +996,50 @@ async function loadCurrentRate(){
   return null;
 }
 
+//LIQUIDACIONES INDIRA ENVIO DEL CORREO
+function sendLiquidationEmail(worker, liquidation){
+  if (!worker?.email) return;
+
+  const form = document.createElement("form");
+  form.style.display = "none";
+
+  const data = {
+    to_name: worker.name,
+    to_email: worker.email,
+    telefono: worker.phone || "No registrado",
+    horas: liquidation.hours,
+    total: liquidation.amount,
+    fecha: new Date().toLocaleDateString("es-CO"),
+    year: new Date().getFullYear()
+  };
+
+  Object.keys(data).forEach(k => {
+    const input = document.createElement("input");
+    input.type = "hidden";
+    input.name = k;
+    input.value = data[k];
+    form.appendChild(input);
+  });
+
+  document.body.appendChild(form);
+
+  emailjs.sendForm("service_vgavcss", "template_143pfyt", form).then(() => {
+      console.log("Correo enviado correctamente");
+    })
+    .catch(err => {
+      console.error("Error enviando correo:", err);
+    })
+    .finally(() => form.remove());
+}
+
+
+// FUNCION QUE LIQUIDA AL TRABAJADOR 
 async function liquidate(workerId){
   const targetWorker = workerId || liquidWorker.value;
-  const targetWorkerData = currentWorkers.find(worker => String(worker.id) === String(targetWorker));
+
+  const targetWorkerData = currentWorkers.find(
+    worker => String(worker.id) === String(targetWorker)
+  );
 
   setGlobalLoader(true, {
     title: "Liquidando trabajador",
@@ -888,11 +1048,27 @@ async function liquidate(workerId){
 
   try {
     const result = await api("liquidateWorker", { worker: targetWorker });
+
     setGlobalLoader(false);
+
+    // 🔹 Datos de liquidación
+    const liquidationData = {
+      hours: result.hours,
+      amount: result.amount
+    };
+
+    // 🔥 ENVÍO DE CORREO (solo si tiene email)
+    if (targetWorkerData?.email) {
+      sendLiquidationEmail(targetWorkerData, liquidationData);
+    } else {
+      console.warn("El trabajador no tiene correo");
+    }
 
     const liquidatedAmount = formatCOP(result.amount);
     const liquidatedHours = formatHoursValue(result.hours);
-    const workerName = escapeHTML(result.name || targetWorkerData?.name || "Trabajador");
+    const workerName = escapeHTML(
+      result.name || targetWorkerData?.name || "Trabajador"
+    );
 
     await showPremiumModal({
       icon: "success",
@@ -905,9 +1081,17 @@ async function liquidate(workerId){
         </div>
       `
     });
-    void Promise.allSettled([loadDashboard(), loadWorkers()]);
+
+    const isHistorySectionActive = document.getElementById("history")?.classList.contains("active");
+    void Promise.allSettled([
+      loadDashboard(),
+      loadWorkers(),
+      isHistorySectionActive ? loadLiquidationsHistory({ showLoader: false }) : Promise.resolve()
+    ]);
+
   } catch (error){
     setGlobalLoader(false);
+
     await showPremiumModal({
       icon: "error",
       title: "No se pudo liquidar",
@@ -1088,6 +1272,215 @@ function updateTimeCaption(text){
   timeTableCaption.textContent = text;
 }
 
+function setHistoryLoader(isVisible){
+  const historyLoader = document.getElementById("historyLoader");
+  if (!historyLoader){
+    return;
+  }
+
+  historyLoader.classList.toggle("visible", isVisible);
+  historyLoader.setAttribute("aria-hidden", String(!isVisible));
+}
+
+function getHistoryElements(){
+  return {
+    historyTableBody: document.getElementById("historyTableBody"),
+    historyCaption: document.getElementById("historyCaption"),
+    historyWorkerFilter: document.getElementById("historyWorkerFilter"),
+    historyDateFilter: document.getElementById("historyDateFilter"),
+    historyDateSearch: document.getElementById("historyDateSearch"),
+    historyDateSuggestions: document.getElementById("historyDateSuggestions"),
+    historyTotalRecords: document.getElementById("historyTotalRecords"),
+    historyTotalAmount: document.getElementById("historyTotalAmount")
+  };
+}
+
+function getFilteredLiquidations(){
+  const { historyWorkerFilter, historyDateFilter, historyDateSearch } = getHistoryElements();
+  const selectedWorker = historyWorkerFilter?.value || "all";
+  const selectedDay = historyDateFilter?.value || "all";
+  const dateQuery = normalizeSearchText(historyDateSearch?.value || "");
+
+  return liquidationHistory.filter(record => {
+    const workerMatches = selectedWorker === "all" || String(record.workerId) === String(selectedWorker);
+    if (!workerMatches){
+      return false;
+    }
+
+    const dayKey = getLiquidationDayKey(record.liquidation_date);
+    const dayMatches = selectedDay === "all" || dayKey === selectedDay;
+    if (!dayMatches){
+      return false;
+    }
+
+    if (!dateQuery){
+      return true;
+    }
+
+    const searchableDate = normalizeSearchText(formatLiquidationDayLabel(record.liquidation_date));
+    const searchableFullDate = normalizeSearchText(formatLiquidationDate(record.liquidation_date));
+    return searchableDate.includes(dateQuery) || searchableFullDate.includes(dateQuery);
+  });
+}
+
+function populateLiquidationWorkerFilter(records = []){
+  const { historyWorkerFilter } = getHistoryElements();
+  if (!historyWorkerFilter){
+    return;
+  }
+
+  const previousValue = historyWorkerFilter.value || "all";
+  const workersById = new Map();
+
+  currentWorkers.forEach(worker => {
+    workersById.set(String(worker.id), worker.name || "Sin nombre");
+  });
+
+  records.forEach(record => {
+    const workerId = String(record.workerId || "").trim();
+    if (!workerId){
+      return;
+    }
+
+    workersById.set(workerId, record.workerName || workersById.get(workerId) || "Sin nombre");
+  });
+
+  const sortedOptions = [...workersById.entries()]
+    .sort((a, b) => a[1].localeCompare(b[1], "es-CO"));
+
+  historyWorkerFilter.innerHTML = `
+    <option value="all">Todos los trabajadores</option>
+    ${sortedOptions.map(([id, name]) => `<option value="${escapeHTML(id)}">${escapeHTML(name)}</option>`).join("")}
+  `;
+
+  const hasPrevious = previousValue === "all" || sortedOptions.some(([id]) => String(id) === String(previousValue));
+  historyWorkerFilter.value = hasPrevious ? previousValue : "all";
+}
+
+function populateLiquidationDateFilter(records = []){
+  const { historyDateFilter, historyDateSuggestions } = getHistoryElements();
+  if (!historyDateFilter){
+    return;
+  }
+
+  const previousValue = historyDateFilter.value || "all";
+  const dayMap = new Map();
+
+  records.forEach(record => {
+    const dayKey = getLiquidationDayKey(record.liquidation_date);
+    if (!dayKey){
+      return;
+    }
+
+    dayMap.set(dayKey, formatLiquidationDayLabel(record.liquidation_date));
+  });
+
+  const sortedDays = [...dayMap.entries()]
+    .sort((a, b) => b[0].localeCompare(a[0]));
+
+  historyDateFilter.innerHTML = `
+    <option value="all">Todas las fechas</option>
+    ${sortedDays.map(([key, label]) => `<option value="${escapeHTML(key)}">${escapeHTML(label)}</option>`).join("")}
+  `;
+
+  if (historyDateSuggestions){
+    historyDateSuggestions.innerHTML = sortedDays
+      .map(([, label]) => `<option value="${escapeHTML(label)}"></option>`)
+      .join("");
+  }
+
+  const hasPrevious = previousValue === "all" || sortedDays.some(([key]) => key === previousValue);
+  historyDateFilter.value = hasPrevious ? previousValue : "all";
+}
+
+function renderLiquidationsHistory(){
+  const {
+    historyTableBody,
+    historyCaption,
+    historyDateFilter,
+    historyDateSearch,
+    historyTotalRecords,
+    historyTotalAmount
+  } = getHistoryElements();
+
+  if (!historyTableBody){
+    return;
+  }
+
+  const filteredRecords = getFilteredLiquidations();
+  const selectedWorkerName = document.getElementById("historyWorkerFilter")?.selectedOptions?.[0]?.text || "todos";
+  const selectedDateName = historyDateFilter?.selectedOptions?.[0]?.text || "todas las fechas";
+  const searchDateText = (historyDateSearch?.value || "").trim();
+
+  if (!filteredRecords.length){
+    historyTableBody.innerHTML = `<tr><td colspan="4" class="time-empty">No hay liquidaciones para el filtro seleccionado.</td></tr>`;
+    if (historyCaption){
+      historyCaption.textContent = `No se encontraron pagos para ${selectedWorkerName.toLowerCase()} en ${selectedDateName.toLowerCase()}${searchDateText ? ` que coincidan con "${searchDateText}"` : ""}.`;
+    }
+    if (historyTotalRecords){
+      historyTotalRecords.textContent = "0";
+    }
+    if (historyTotalAmount){
+      historyTotalAmount.textContent = formatCOP(0);
+    }
+    return;
+  }
+
+  historyTableBody.innerHTML = filteredRecords.map(record => `
+    <tr>
+      <td>${escapeHTML(record.workerName || "Sin nombre")}</td>
+      <td>${formatLiquidationDate(record.liquidation_date)}</td>
+      <td>${formatHoursValue(record.hours_paid || 0)} h</td>
+      <td><span class="history-paid-chip">${formatCOP(record.amount_paid || 0)}</span></td>
+    </tr>
+  `).join("");
+
+  const totalAmount = filteredRecords.reduce((acc, record) => acc + Number(record.amount_paid || 0), 0);
+
+  if (historyCaption){
+    historyCaption.textContent = `Mostrando ${filteredRecords.length} pagos para ${selectedWorkerName.toLowerCase()} en ${selectedDateName.toLowerCase()}${searchDateText ? ` filtrados por "${searchDateText}"` : ""}.`;
+  }
+  if (historyTotalRecords){
+    historyTotalRecords.textContent = String(filteredRecords.length);
+  }
+  if (historyTotalAmount){
+    historyTotalAmount.textContent = formatCOP(totalAmount);
+  }
+}
+
+async function loadLiquidationsHistory({ showLoader = true } = {}){
+  const { historyTableBody, historyCaption } = getHistoryElements();
+  if (!historyTableBody){
+    return [];
+  }
+
+  if (showLoader){
+    setHistoryLoader(true);
+  }
+
+  try {
+    const response = await api("getLiquidations");
+    liquidationHistory = Array.isArray(response) ? response : [];
+    populateLiquidationWorkerFilter(liquidationHistory);
+    populateLiquidationDateFilter(liquidationHistory);
+    renderLiquidationsHistory();
+    return liquidationHistory;
+  } catch (error){
+    liquidationHistory = [];
+    historyTableBody.innerHTML = `<tr><td colspan="4" class="time-empty">No fue posible cargar el historial en este momento.</td></tr>`;
+    if (historyCaption){
+      historyCaption.textContent = "Hubo un problema al cargar el historial de liquidaciones.";
+    }
+    return [];
+  } finally {
+    setHistoryLoader(false);
+  }
+}
+
+async function refreshLiquidationsHistory(){
+  await loadLiquidationsHistory({ showLoader: true });
+}
+
 workerSelect.addEventListener("change", () => {
   if (attendanceMode === "multi" && selectedBatchWorkers.size === 0 && workerSelect.value){
     selectedBatchWorkers.add(String(workerSelect.value));
@@ -1096,6 +1489,27 @@ workerSelect.addEventListener("change", () => {
 
   loadTimeLogs({ showLoader: true });
 });
+
+const historyWorkerFilter = document.getElementById("historyWorkerFilter");
+if (historyWorkerFilter){
+  historyWorkerFilter.addEventListener("change", () => {
+    renderLiquidationsHistory();
+  });
+}
+
+const historyDateFilter = document.getElementById("historyDateFilter");
+if (historyDateFilter){
+  historyDateFilter.addEventListener("change", () => {
+    renderLiquidationsHistory();
+  });
+}
+
+const historyDateSearch = document.getElementById("historyDateSearch");
+if (historyDateSearch){
+  historyDateSearch.addEventListener("input", () => {
+    renderLiquidationsHistory();
+  });
+}
 
 setInterval(() => {
   document.querySelectorAll(".liveTimer").forEach(el => {
@@ -1112,12 +1526,18 @@ async function loadTimeLogs({ showLoader = true } = {}){
   if (!workerId){
     timeLogsTable.innerHTML = `<tr><td colspan="4" class="time-empty">Selecciona un trabajador para ver los marcajes.</td></tr>`;
     updateTimeCaption("Selecciona un trabajador para ver sus registros.");
+    if (showLoader){
+      setGlobalLoader(false);
+    }
     setTimeLoader(false);
     return;
   }
 
   if (showLoader){
-    setTimeLoader(true);
+    setGlobalLoader(true, {
+      title: "Cargando marcajes",
+      text: `Estamos consultando los registros de ${workerName}.`
+    });
   }
 
   updateTimeCaption(`Mostrando los registros mas recientes de ${workerName}.`);
@@ -1159,8 +1579,8 @@ async function loadTimeLogs({ showLoader = true } = {}){
       return `
         <tr>
           <td>${log.workerName}</td>
-          <td>${inFormatted}</td>
-          <td>${outFormatted}</td>
+          <td><span class="time-chip time-chip-in">${inFormatted}</span></td>
+          <td>${outDate ? `<span class="time-chip time-chip-out">${outFormatted}</span>` : `<span class="time-chip time-chip-pending">${outFormatted}</span>`}</td>
           <td>${status}</td>
         </tr>
       `;
@@ -1169,6 +1589,9 @@ async function loadTimeLogs({ showLoader = true } = {}){
     timeLogsTable.innerHTML = `<tr><td colspan="4" class="time-empty">No fue posible cargar los marcajes en este momento.</td></tr>`;
     updateTimeCaption(`Hubo un problema cargando los registros de ${workerName}.`);
   } finally {
+    if (showLoader){
+      setGlobalLoader(false);
+    }
     setTimeLoader(false);
   }
 }
