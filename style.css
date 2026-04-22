@@ -621,6 +621,77 @@ textarea{
  min-height:0;
 }
 
+.history-panel{
+ display:grid;
+ gap:22px;
+ min-height:0;
+}
+
+.history-header{
+ display:flex;
+ justify-content:space-between;
+ align-items:flex-start;
+ gap:16px;
+ flex-wrap:wrap;
+}
+
+.history-header h2{
+ margin:0;
+}
+
+.history-controls{
+ display:flex;
+ justify-content:space-between;
+ align-items:flex-end;
+ gap:18px;
+ flex-wrap:wrap;
+ padding:18px;
+ border-radius:22px;
+ background:linear-gradient(180deg,rgba(255,255,255,.9),rgba(255,247,252,.82));
+ border:1px solid rgba(255,255,255,.75);
+ box-shadow:var(--shadow-soft);
+}
+
+.history-filters{
+ display:grid;
+ grid-template-columns:repeat(auto-fit,minmax(230px,1fr));
+ gap:12px;
+ flex:1 1 680px;
+}
+
+.history-controls .history-filters .select-shell{
+ min-width:min(100%,320px);
+}
+
+.history-kpis{
+ display:flex;
+ gap:10px;
+ flex-wrap:wrap;
+}
+
+.history-kpi{
+ min-width:160px;
+ padding:12px 14px;
+ border-radius:14px;
+ background:rgba(255,180,226,.08);
+ border:1px solid rgba(255,180,226,.14);
+ display:grid;
+ gap:4px;
+}
+
+.history-kpi span{
+ color:#6b708f;
+ font-size:12px;
+ font-weight:700;
+ letter-spacing:.04em;
+ text-transform:uppercase;
+}
+
+.history-kpi strong{
+ color:#252a43;
+ font-size:22px;
+}
+
 .time-panel-header{
  display:flex;
  justify-content:space-between;
@@ -962,6 +1033,41 @@ textarea{
  letter-spacing:.03em;
 }
 
+.time-chip{
+ display:inline-flex;
+ align-items:center;
+ padding:8px 12px;
+ border-radius:12px;
+ font-weight:700;
+ line-height:1.2;
+}
+
+.time-chip-in{
+ background:rgba(0,230,118,.85);
+ color:#101010;
+}
+
+.time-chip-out{
+ background:rgba(255,82,82,.92);
+ color:#fff;
+}
+
+.time-chip-pending{
+ background:rgba(120,127,150,.18);
+ color:#4f566f;
+}
+
+.history-paid-chip{
+ display:inline-flex;
+ align-items:center;
+ justify-content:center;
+ padding:8px 12px;
+ border-radius:12px;
+ background:rgba(0,230,118,.82);
+ color:#111;
+ font-weight:700;
+}
+
 .time-loader{
  position:absolute;
  inset:14px 18px 18px;
@@ -1282,6 +1388,33 @@ textarea{
   width:100%;
  }
 
+ .history-header{
+  align-items:stretch;
+ }
+
+ .history-header .refresh-workers-btn{
+  width:100%;
+  justify-content:center;
+ }
+
+ .history-controls{
+  align-items:stretch;
+  padding:16px;
+ }
+
+ .history-filters{
+  width:100%;
+  grid-template-columns:1fr;
+ }
+
+ .history-kpis{
+  width:100%;
+ }
+
+ .history-kpi{
+  flex:1 1 180px;
+ }
+
  .multi-worker-list{
   max-height:160px;
  }
@@ -1391,6 +1524,15 @@ textarea{
  .time-box{
   gap:16px;
   padding:18px;
+ }
+
+ .history-controls{
+  padding:14px;
+  border-radius:18px;
+ }
+
+ .history-kpi{
+  min-width:0;
  }
 
  .time-actions{
