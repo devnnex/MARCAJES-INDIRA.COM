@@ -32,6 +32,7 @@ let attendanceMode = "single";
 let selectedBatchWorkers = new Set();
 let adminUnlocked = false;
 let liquidationHistory = [];
+const visualDaysBaselineByWorker = new Map();
 
 const ADMIN_PIN = "5678";
 const PROTECTED_SECTIONS = new Set(["dashboard", "workers", "history"]);
@@ -442,6 +443,20 @@ function renderWorkers(workers = currentWorkers){
         })
       : "Sin liquidar";
 
+    const workerId = String(worker.id);
+    const rawDays = Number(worker.days || 0);
+    const baselineDays = visualDaysBaselineByWorker.get(workerId);
+    let visualDays = rawDays;
+
+    if (typeof baselineDays === "number"){
+      if (rawDays < baselineDays){
+        // El backend reinicio dias; ya no necesitamos el baseline visual.
+        visualDaysBaselineByWorker.delete(workerId);
+      } else {
+        visualDays = Math.max(0, rawDays - baselineDays);
+      }
+    }
+
     const status = worker.active
       ? `<div style="color:#00e676;font-weight:bold">EN TURNO</div>`
       : `<div style="color:#9e9e9e">Fuera de turno</div>`;
@@ -460,7 +475,7 @@ function renderWorkers(workers = currentWorkers){
           <span>${money}</span>
         </div>
 
-        <div>Dias trabajados: ${worker.days || 0}</div>
+        <div>Dias trabajados: ${visualDays}</div>
 
         ${status}
         ${timer}
@@ -795,37 +810,122 @@ function buildBatchAttendanceRows(results, maxRows = 8){
     </div>`;
 }
 
-async function registerAttendance(action){
-  const isCheckIn = action === "checkIn";
-  const selectedWorkerIds = getSelectedAttendanceWorkerIds();
-
-  if (!selectedWorkerIds.length){
-    showPremiumModal({
-      icon: "warning",
-      title: "Seleccion requerida",
-      text: attendanceMode === "multi"
-        ? "Selecciona uno o mas trabajadores en el modo multiple."
-        : "Selecciona un trabajador para registrar el marcaje."
-    });
-    return;
+function isRetryableAttendanceError(error){
+  if (!error){
+    return false;
   }
 
-  setGlobalLoader(true, {
-    title: isCheckIn ? "Registrando entradas" : "Registrando salidas",
-    text: isCheckIn
-      ? "Estamos marcando la entrada de los trabajadores seleccionados."
-      : "Estamos marcando la salida de los trabajadores seleccionados."
-  });
+  const message = typeof error === "string"
+    ? error
+    : String(error.message || error.name || "");
 
-  let settledResults = [];
-  try {
-    settledResults = await Promise.allSettled(
-      selectedWorkerIds.map(workerId => api(action, { worker: workerId }))
+  return /network|fetch|timeout|429|5\d\d|tempor|limit|quota|rate/i.test(message);
+}
+
+function parseWorkerActiveState(activeValue){
+  if (typeof activeValue === "boolean"){
+    return activeValue;
+  }
+
+  if (typeof activeValue === "number"){
+    return activeValue > 0;
+  }
+
+  if (typeof activeValue === "string"){
+    const normalized = activeValue.trim().toLowerCase();
+    if (["true", "1", "si", "sí", "yes", "on"].includes(normalized)){
+      return true;
+    }
+    if (["false", "0", "no", "off", ""].includes(normalized)){
+      return false;
+    }
+  }
+
+  return Boolean(activeValue);
+}
+
+async function executeAttendanceBatch(action, selectedWorkerIds, {
+  maxAttempts = 3,
+  retryDelayMs = 180
+} = {}){
+  const idsInOrder = [...selectedWorkerIds];
+  const resultsByWorkerId = new Map();
+  let pendingIds = [...idsInOrder];
+
+  for (let attempt = 1; attempt <= maxAttempts && pendingIds.length; attempt += 1){
+    const waveResults = await Promise.allSettled(
+      pendingIds.map(workerId => api(action, { worker: workerId }))
     );
-  } finally {
-    setGlobalLoader(false);
+
+    const retryIds = [];
+
+    waveResults.forEach((result, index) => {
+      const workerId = pendingIds[index];
+
+      if (result.status === "fulfilled" && !result.value?.error){
+        resultsByWorkerId.set(workerId, result);
+        return;
+      }
+
+      const isRetryable = result.status === "fulfilled"
+        ? isRetryableAttendanceError(result.value?.error)
+        : isRetryableAttendanceError(result.reason);
+
+      if (isRetryable && attempt < maxAttempts){
+        retryIds.push(workerId);
+        return;
+      }
+
+      resultsByWorkerId.set(workerId, result);
+    });
+
+    pendingIds = retryIds;
+
+    if (pendingIds.length && attempt < maxAttempts){
+      await wait(retryDelayMs);
+    }
   }
 
+  return idsInOrder.map(workerId =>
+    resultsByWorkerId.get(workerId) || {
+      status: "rejected",
+      reason: new Error("No se pudo completar el marcaje.")
+    }
+  );
+}
+
+async function getUnconfirmedAttendanceWorkerIds(action, workerIds, {
+  attempts = 3,
+  delayMs = 240
+} = {}){
+  const expectedActive = action === "checkIn";
+  let pendingIds = [...new Set(workerIds.map(workerId => String(workerId)))];
+
+  for (let attempt = 1; attempt <= attempts && pendingIds.length; attempt += 1){
+    const workers = await getWorkersData();
+    const workersById = new Map(
+      (Array.isArray(workers) ? workers : [])
+        .map(worker => [String(worker.id), parseWorkerActiveState(worker.active)])
+    );
+
+    pendingIds = pendingIds.filter(workerId => {
+      const hasWorker = workersById.has(workerId);
+      if (!hasWorker){
+        return true;
+      }
+
+      return workersById.get(workerId) !== expectedActive;
+    });
+
+    if (pendingIds.length && attempt < attempts){
+      await wait(delayMs);
+    }
+  }
+
+  return pendingIds;
+}
+
+function buildAttendanceSummary(settledResults, selectedWorkerIds){
   const successResults = [];
   const failedResults = [];
 
@@ -851,6 +951,102 @@ async function registerAttendance(action){
       earned: Number(payload.earned || 0)
     });
   });
+
+  return { successResults, failedResults };
+}
+
+async function executeAttendanceBatchSequential(action, selectedWorkerIds, {
+  maxAttempts = 2,
+  retryDelayMs = 90,
+  onProgress = null
+} = {}){
+  const settledResults = [];
+  const totalWorkers = selectedWorkerIds.length;
+
+  for (let index = 0; index < totalWorkers; index += 1){
+    const workerId = selectedWorkerIds[index];
+    const workerName = getWorkerNameById(workerId);
+
+    if (typeof onProgress === "function"){
+      onProgress({
+        current: index + 1,
+        total: totalWorkers,
+        workerId,
+        workerName
+      });
+    }
+
+    let finalResult = { status: "rejected", reason: new Error("No se pudo completar el marcaje.") };
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1){
+      try {
+        const payload = await api(action, { worker: workerId });
+        finalResult = { status: "fulfilled", value: payload };
+
+        if (!payload?.error){
+          break;
+        }
+
+        const shouldRetry = isRetryableAttendanceError(payload.error) && attempt < maxAttempts;
+        if (!shouldRetry){
+          break;
+        }
+      } catch (error){
+        finalResult = { status: "rejected", reason: error };
+        const shouldRetry = isRetryableAttendanceError(error) && attempt < maxAttempts;
+        if (!shouldRetry){
+          break;
+        }
+      }
+
+      await wait(retryDelayMs);
+    }
+
+    settledResults.push(finalResult);
+  }
+
+  return settledResults;
+}
+
+async function registerAttendance(action){
+  const isCheckIn = action === "checkIn";
+  const selectedWorkerIds = getSelectedAttendanceWorkerIds();
+
+  if (!selectedWorkerIds.length){
+    showPremiumModal({
+      icon: "warning",
+      title: "Seleccion requerida",
+      text: attendanceMode === "multi"
+        ? "Selecciona uno o mas trabajadores en el modo multiple."
+        : "Selecciona un trabajador para registrar el marcaje."
+    });
+    return;
+  }
+
+  setGlobalLoader(true, {
+    title: isCheckIn ? "Registrando entradas" : "Registrando salidas",
+    text: isCheckIn
+      ? "Estamos marcando la entrada de los trabajadores seleccionados."
+      : "Estamos marcando la salida de los trabajadores seleccionados."
+  });
+
+  let settledResults = [];
+  try {
+    settledResults = await executeAttendanceBatchSequential(action, selectedWorkerIds, {
+      maxAttempts: 2,
+      retryDelayMs: 90,
+      onProgress: ({ current, total, workerName }) => {
+        setGlobalLoader(true, {
+          title: isCheckIn ? "Registrando entradas" : "Registrando salidas",
+          text: `${current}/${total} - ${workerName}`
+        });
+      }
+    });
+  } finally {
+    setGlobalLoader(false);
+  }
+
+  const { successResults, failedResults } = buildAttendanceSummary(settledResults, selectedWorkerIds);
 
   if (!successResults.length){
     showPremiumModal({
@@ -1036,9 +1232,10 @@ function sendLiquidationEmail(worker, liquidation){
 // FUNCION QUE LIQUIDA AL TRABAJADOR 
 async function liquidate(workerId){
   const targetWorker = workerId || liquidWorker.value;
+  const targetWorkerId = String(targetWorker);
 
   const targetWorkerData = currentWorkers.find(
-    worker => String(worker.id) === String(targetWorker)
+    worker => String(worker.id) === targetWorkerId
   );
 
   setGlobalLoader(true, {
@@ -1081,6 +1278,10 @@ async function liquidate(workerId){
         </div>
       `
     });
+
+    // Reset visual de dias desde la ultima liquidacion.
+    visualDaysBaselineByWorker.set(targetWorkerId, Number(targetWorkerData?.days || 0));
+    renderWorkers(currentWorkers);
 
     const isHistorySectionActive = document.getElementById("history")?.classList.contains("active");
     void Promise.allSettled([
