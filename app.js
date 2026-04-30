@@ -33,9 +33,13 @@ let selectedBatchWorkers = new Set();
 let adminUnlocked = false;
 let liquidationHistory = [];
 const visualDaysBaselineByWorker = new Map();
+const readCache = new Map();
+const inFlightReads = new Map();
 
 const ADMIN_PIN = "5678";
 const PROTECTED_SECTIONS = new Set(["dashboard", "workers", "history"]);
+const READ_CACHE_MS = 7000;
+const FAST_CACHE_MS = 3000;
 
 function formatCOP(value){
   const numericValue = Number(value);
@@ -463,30 +467,86 @@ async function loadTimeSection(){
   } catch (error){
     setGlobalLoader(false);
     throw error;
+  } finally {
+    setGlobalLoader(false);
   }
 }
 
-async function api(action, data = {}){
-  const res = await fetch(API, {
+function getApiCacheKey(action, data = {}){
+  return `${action}:${JSON.stringify(data || {})}`;
+}
+
+function isReadAction(action){
+  return /^get/i.test(action);
+}
+
+function invalidateReadCache(){
+  readCache.clear();
+  inFlightReads.clear();
+}
+
+async function api(action, data = {}, {
+  cacheMs = 0,
+  force = false
+} = {}){
+  const canCache = isReadAction(action) && cacheMs > 0;
+  const cacheKey = canCache ? getApiCacheKey(action, data) : "";
+
+  if (canCache && !force){
+    const cached = readCache.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp < cacheMs){
+      return cached.value;
+    }
+
+    const inFlight = inFlightReads.get(cacheKey);
+    if (inFlight){
+      return inFlight;
+    }
+  }
+
+  const request = fetch(API, {
     method: "POST",
     cache: "no-store",
     headers: {
       "Content-Type": "text/plain;charset=utf-8"
     },
     body: JSON.stringify({ action, ...data })
-  });
+  })
+    .then(async res => {
+      const rawResponse = await res.text();
+      if (!rawResponse || rawResponse.trim() === "" || rawResponse.trim() === "undefined"){
+        return {};
+      }
 
-  const rawResponse = await res.text();
-  if (!rawResponse || rawResponse.trim() === "" || rawResponse.trim() === "undefined"){
-    return {};
+      return JSON.parse(rawResponse);
+    })
+    .then(result => {
+      if (canCache){
+        readCache.set(cacheKey, {
+          timestamp: Date.now(),
+          value: result
+        });
+      } else if (!isReadAction(action)){
+        invalidateReadCache();
+      }
+
+      return result;
+    })
+    .finally(() => {
+      if (canCache){
+        inFlightReads.delete(cacheKey);
+      }
+    });
+
+  if (canCache){
+    inFlightReads.set(cacheKey, request);
   }
 
-  return JSON.parse(rawResponse);
+  return request;
 }
 
 async function addWorker(){
   const { nameInput, phoneInput, emailInput } = getWorkerFormFields();
-  const previousCount = currentWorkers.length;
   const payload = {
     name: nameInput.value.trim(),
     phone: phoneInput.value.trim(),
@@ -516,32 +576,31 @@ async function addWorker(){
     emailInput.value = "";
 
     insertOptimisticWorker(result, payload);
-    await loadWorkers();
-    await syncWorkersUI({
-      loaderTitle: "Actualizando trabajadores",
-      loaderText: "Estamos sincronizando la lista para mostrar el nuevo registro.",
-      attempts: 10,
-      delayMs: 500,
-      match: workers => workers.length > previousCount
-    });
-    await loadDashboard();
-
     shouldShowSuccess = true;
   } finally {
     setGlobalLoader(false);
   }
 
+  void Promise.allSettled([
+    loadWorkers({ force: true }),
+    loadDashboard({ force: true })
+  ]);
+
   if (shouldShowSuccess){
     await wait(80);
     await showPremiumModal({
       icon: "success",
-      title: "Cambio exitoso"
+      title: "Cambio exitoso",
+      text: "Recuerda refrescarlo desde el boton refrescar para ver los cambios."
     });
   }
 }
 
-async function getWorkersData(){
-  return api("getWorkers");
+async function getWorkersData({ force = false } = {}){
+  return api("getWorkers", {}, {
+    cacheMs: READ_CACHE_MS,
+    force
+  });
 }
 
 function renderWorkers(workers = currentWorkers){
@@ -633,8 +692,8 @@ function handleWorkerSearch(){
   renderWorkers(currentWorkers);
 }
 
-async function loadWorkers(){
-  const workers = await getWorkersData();
+async function loadWorkers({ force = false } = {}){
+  const workers = await getWorkersData({ force });
   renderWorkers(workers);
   return workers;
 }
@@ -646,7 +705,7 @@ async function refreshWorkers(){
   });
 
   try {
-    await loadWorkers();
+    await loadWorkers({ force: true });
   } finally {
     setGlobalLoader(false);
   }
@@ -712,7 +771,6 @@ function fillWorkerSelects(workers){
 }
 
 async function deleteWorker(id){
-  const previousCount = currentWorkers.length;
   setGlobalLoader(true, {
     title: "Eliminando trabajador",
     text: "Estamos actualizando la lista para reflejar el cambio."
@@ -721,18 +779,14 @@ async function deleteWorker(id){
   try {
     await api("deleteWorker", { id });
     removeOptimisticWorker(id);
-    await loadWorkers();
-    await syncWorkersUI({
-      loaderTitle: "Actualizando trabajadores",
-      loaderText: "Estamos sincronizando la lista despues de la eliminacion.",
-      attempts: 10,
-      delayMs: 500,
-      match: workers => workers.length < previousCount
-    });
-    await loadDashboard();
   } finally {
     setGlobalLoader(false);
   }
+
+  void Promise.allSettled([
+    loadWorkers({ force: true }),
+    loadDashboard({ force: true })
+  ]);
 }
 
 async function editWorker(id, currentName, currentPhone, currentEmail){
@@ -808,21 +862,24 @@ async function editWorker(id, currentName, currentPhone, currentEmail){
       email: value.email
     });
 
-    await loadWorkers();
+    updateOptimisticWorker(workerId, value);
     if (workerSelect.value && String(workerSelect.value) === workerId){
-      await loadTimeLogs({ showLoader: false });
-    }
-    if (adminUnlocked){
-      await loadDashboard();
+      updateSelectedWorkerName(value.name);
     }
   } finally {
     setGlobalLoader(false);
   }
 
+  void Promise.allSettled([
+    loadWorkers({ force: true }),
+    adminUnlocked ? loadDashboard({ force: true }) : Promise.resolve()
+  ]);
+
   await wait(80);
   await showPremiumModal({
     icon: "success",
-    title: "Cambio exitoso"
+    title: "Cambio exitoso",
+    text: "Recuerda refrescarlo desde el boton refrescar para ver los cambios."
   });
 }
 
@@ -914,14 +971,14 @@ async function openWorkerRateModal(id){
         : worker
     );
     renderWorkers(currentWorkers);
-
-    await loadWorkers();
-    if (adminUnlocked){
-      await loadDashboard();
-    }
   } finally {
     setGlobalLoader(false);
   }
+
+  void Promise.allSettled([
+    loadWorkers({ force: true }),
+    adminUnlocked ? loadDashboard({ force: true }) : Promise.resolve()
+  ]);
 
   await showPremiumModal({
     icon: "success",
@@ -1136,7 +1193,7 @@ async function getUnconfirmedAttendanceWorkerIds(action, workerIds, {
   let pendingIds = [...new Set(workerIds.map(workerId => String(workerId)))];
 
   for (let attempt = 1; attempt <= attempts && pendingIds.length; attempt += 1){
-    const workers = await getWorkersData();
+    const workers = await getWorkersData({ force: true });
     const workersById = new Map(
       (Array.isArray(workers) ? workers : [])
         .map(worker => [String(worker.id), parseWorkerActiveState(worker.active)])
@@ -1157,6 +1214,64 @@ async function getUnconfirmedAttendanceWorkerIds(action, workerIds, {
   }
 
   return pendingIds;
+}
+
+async function ensureAttendanceBatchCompletion(action, selectedWorkerIds, settledResults, {
+  maxVerifyAttempts = 3,
+  verifyDelayMs = 260
+} = {}){
+  const idsInOrder = selectedWorkerIds.map(workerId => String(workerId));
+  const resultsByWorkerId = new Map(
+    idsInOrder.map((workerId, index) => [workerId, settledResults[index]])
+  );
+
+  let unconfirmedIds = await getUnconfirmedAttendanceWorkerIds(action, idsInOrder, {
+    attempts: maxVerifyAttempts,
+    delayMs: verifyDelayMs
+  });
+
+  if (!unconfirmedIds.length){
+    return idsInOrder.map(workerId => resultsByWorkerId.get(workerId));
+  }
+
+  setGlobalLoader(true, {
+    title: "Verificando marcajes",
+    text: `Reintentando ${unconfirmedIds.length} registros no confirmados.`
+  });
+
+  const retryResults = await executeAttendanceBatchSequential(action, unconfirmedIds, {
+    maxAttempts: 3,
+    retryDelayMs: 150,
+    onProgress: ({ current, total, workerName }) => {
+      setGlobalLoader(true, {
+        title: "Reintentando marcajes",
+        text: `${current}/${total} - ${workerName}`
+      });
+    }
+  });
+
+  unconfirmedIds.forEach((workerId, index) => {
+    resultsByWorkerId.set(String(workerId), retryResults[index]);
+  });
+
+  unconfirmedIds = await getUnconfirmedAttendanceWorkerIds(action, unconfirmedIds, {
+    attempts: maxVerifyAttempts,
+    delayMs: verifyDelayMs
+  });
+
+  unconfirmedIds.forEach(workerId => {
+    resultsByWorkerId.set(String(workerId), {
+      status: "rejected",
+      reason: new Error("No se pudo confirmar el marcaje del trabajador.")
+    });
+  });
+
+  return idsInOrder.map(workerId =>
+    resultsByWorkerId.get(workerId) || {
+      status: "rejected",
+      reason: new Error("No se pudo completar el marcaje.")
+    }
+  );
 }
 
 function buildAttendanceSummary(settledResults, selectedWorkerIds){
@@ -1187,6 +1302,29 @@ function buildAttendanceSummary(settledResults, selectedWorkerIds){
   });
 
   return { successResults, failedResults };
+}
+
+function applyOptimisticAttendanceState(results, isActive){
+  const successfulIds = new Set(
+    results
+      .filter(result => result?.workerId)
+      .map(result => String(result.workerId))
+  );
+
+  if (!successfulIds.size){
+    return;
+  }
+
+  currentWorkers = currentWorkers.map(worker =>
+    successfulIds.has(String(worker.id))
+      ? normalizeWorker({
+          ...worker,
+          active: isActive,
+          activeStart: isActive ? new Date().toISOString() : ""
+        })
+      : normalizeWorker(worker)
+  );
+  renderWorkers(currentWorkers);
 }
 
 async function executeAttendanceBatchSequential(action, selectedWorkerIds, {
@@ -1266,21 +1404,35 @@ async function registerAttendance(action){
 
   let settledResults = [];
   try {
-    settledResults = await executeAttendanceBatchSequential(action, selectedWorkerIds, {
-      maxAttempts: 2,
-      retryDelayMs: 90,
-      onProgress: ({ current, total, workerName }) => {
-        setGlobalLoader(true, {
-          title: isCheckIn ? "Registrando entradas" : "Registrando salidas",
-          text: `${current}/${total} - ${workerName}`
-        });
-      }
-    });
+    if (selectedWorkerIds.length === 1){
+      settledResults = await executeAttendanceBatchSequential(action, selectedWorkerIds, {
+        maxAttempts: 2,
+        retryDelayMs: 90,
+        onProgress: ({ current, total, workerName }) => {
+          setGlobalLoader(true, {
+            title: isCheckIn ? "Registrando entradas" : "Registrando salidas",
+            text: `${current}/${total} - ${workerName}`
+          });
+        }
+      });
+    } else {
+      setGlobalLoader(true, {
+        title: isCheckIn ? "Registrando entradas" : "Registrando salidas",
+        text: `Procesando ${selectedWorkerIds.length} trabajadores al mismo tiempo.`
+      });
+      settledResults = await executeAttendanceBatch(action, selectedWorkerIds, {
+        maxAttempts: 2,
+        retryDelayMs: 120
+      });
+    }
+
+    settledResults = await ensureAttendanceBatchCompletion(action, selectedWorkerIds, settledResults);
   } finally {
     setGlobalLoader(false);
   }
 
   const { successResults, failedResults } = buildAttendanceSummary(settledResults, selectedWorkerIds);
+  applyOptimisticAttendanceState(successResults, isCheckIn);
 
   if (!successResults.length){
     showPremiumModal({
@@ -1320,8 +1472,8 @@ async function registerAttendance(action){
   const selectedViewerWorker = String(workerSelect.value || "");
   const shouldRefreshLogs = successResults.some(result => String(result.workerId) === selectedViewerWorker);
   void Promise.allSettled([
-    refreshLive(),
-    shouldRefreshLogs ? loadTimeLogs({ showLoader: false }) : Promise.resolve()
+    refreshLive({ force: true }),
+    shouldRefreshLogs ? loadTimeLogs({ showLoader: false, force: true }) : Promise.resolve()
   ]);
 }
 
@@ -1333,10 +1485,10 @@ async function checkOut(){
   await registerAttendance("checkOut");
 }
 
-async function refreshLive(){
-  await loadWorkers();
+async function refreshLive({ force = false } = {}){
+  await loadWorkers({ force });
   if (adminUnlocked){
-    await loadDashboard();
+    await loadDashboard({ force });
   }
 }
 
@@ -1364,11 +1516,7 @@ async function saveRate(){
 
   try {
     await api("setRate", { value: nextRate });
-    await loadDashboard();
-    await loadCurrentRate();
-    if (currentHourRate === null){
-      setCurrentRate(nextRate);
-    }
+    setCurrentRate(nextRate);
     clearRateInput();
     renderCurrentRate(currentHourRate ?? nextRate);
 
@@ -1380,10 +1528,18 @@ async function saveRate(){
   } finally {
     setGlobalLoader(false);
   }
+
+  void Promise.allSettled([
+    loadDashboard({ force: true }),
+    loadWorkers({ force: true })
+  ]);
 }
 
-async function loadDashboard(){
-  const dashboard = await api("getDashboard");
+async function loadDashboard({ force = false } = {}){
+  const dashboard = await api("getDashboard", {}, {
+    cacheMs: FAST_CACHE_MS,
+    force
+  });
 
   kpiWorkers.textContent = dashboard.workers;
   kpiHours.textContent = dashboard.hours;
@@ -1400,7 +1556,9 @@ async function loadDashboard(){
 
 async function loadCurrentRate(){
   try {
-    const settingsResponse = await api("getSettings");
+    const settingsResponse = await api("getSettings", {}, {
+      cacheMs: READ_CACHE_MS
+    });
     const backendRate = extractRateFromSettings(settingsResponse);
 
     if (backendRate !== null){
@@ -1412,7 +1570,9 @@ async function loadCurrentRate(){
   }
 
   try {
-    const dashboard = await api("getDashboard");
+    const dashboard = await api("getDashboard", {}, {
+      cacheMs: FAST_CACHE_MS
+    });
     const backendRate = getRateFromDashboard(dashboard);
 
     if (backendRate !== null){
@@ -1519,9 +1679,9 @@ async function liquidate(workerId){
 
     const isHistorySectionActive = document.getElementById("history")?.classList.contains("active");
     void Promise.allSettled([
-      loadDashboard(),
-      loadWorkers(),
-      isHistorySectionActive ? loadLiquidationsHistory({ showLoader: false }) : Promise.resolve()
+      loadDashboard({ force: true }),
+      loadWorkers({ force: true }),
+      isHistorySectionActive ? loadLiquidationsHistory({ showLoader: false, force: true }) : Promise.resolve()
     ]);
 
   } catch (error){
@@ -1704,6 +1864,23 @@ function removeOptimisticWorker(id){
   renderWorkers(currentWorkers);
 }
 
+function updateOptimisticWorker(id, updates = {}){
+  const workerId = String(id);
+  currentWorkers = currentWorkers.map(worker =>
+    String(worker.id) === workerId
+      ? normalizeWorker({ ...worker, ...updates })
+      : normalizeWorker(worker)
+  );
+  renderWorkers(currentWorkers);
+}
+
+function updateSelectedWorkerName(name){
+  const selectedOption = workerSelect.options[workerSelect.selectedIndex];
+  if (selectedOption && name){
+    selectedOption.textContent = name;
+  }
+}
+
 function updateTimeCaption(text){
   timeTableCaption.textContent = text;
 }
@@ -1884,7 +2061,7 @@ function renderLiquidationsHistory(){
   }
 }
 
-async function loadLiquidationsHistory({ showLoader = true } = {}){
+async function loadLiquidationsHistory({ showLoader = true, force = false } = {}){
   const { historyTableBody, historyCaption } = getHistoryElements();
   if (!historyTableBody){
     return [];
@@ -1895,7 +2072,10 @@ async function loadLiquidationsHistory({ showLoader = true } = {}){
   }
 
   try {
-    const response = await api("getLiquidations");
+    const response = await api("getLiquidations", {}, {
+      cacheMs: READ_CACHE_MS,
+      force: force || showLoader
+    });
     liquidationHistory = Array.isArray(response) ? response : [];
     populateLiquidationWorkerFilter(liquidationHistory);
     populateLiquidationDateFilter(liquidationHistory);
@@ -1955,31 +2135,28 @@ setInterval(() => {
   });
 }, 1000);
 
-async function loadTimeLogs({ showLoader = true } = {}){
+async function loadTimeLogs({ showLoader = true, force = false } = {}){
   const workerId = workerSelect.value;
   const workerName = workerSelect.options[workerSelect.selectedIndex]?.text || "este trabajador";
 
   if (!workerId){
     timeLogsTable.innerHTML = `<tr><td colspan="4" class="time-empty">Selecciona un trabajador para ver los marcajes.</td></tr>`;
     updateTimeCaption("Selecciona un trabajador para ver sus registros.");
-    if (showLoader){
-      setGlobalLoader(false);
-    }
     setTimeLoader(false);
     return;
   }
 
   if (showLoader){
-    setGlobalLoader(true, {
-      title: "Cargando marcajes",
-      text: `Estamos consultando los registros de ${workerName}.`
-    });
+    setTimeLoader(true);
   }
 
   updateTimeCaption(`Mostrando los registros mas recientes de ${workerName}.`);
 
   try {
-    const logs = await api("getTimeLogsByWorker", { worker: workerId });
+    const logs = await api("getTimeLogsByWorker", { worker: workerId }, {
+      cacheMs: FAST_CACHE_MS,
+      force
+    });
 
     if (!logs.length){
       timeLogsTable.innerHTML = `<tr><td colspan="4" class="time-empty">${workerName} aun no tiene marcajes registrados.</td></tr>`;
@@ -2025,9 +2202,6 @@ async function loadTimeLogs({ showLoader = true } = {}){
     timeLogsTable.innerHTML = `<tr><td colspan="4" class="time-empty">No fue posible cargar los marcajes en este momento.</td></tr>`;
     updateTimeCaption(`Hubo un problema cargando los registros de ${workerName}.`);
   } finally {
-    if (showLoader){
-      setGlobalLoader(false);
-    }
     setTimeLoader(false);
   }
 }
@@ -2039,4 +2213,4 @@ setInterval(() => {
   if (adminUnlocked){
     loadDashboard();
   }
-}, 5000);
+}, 30000);
