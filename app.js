@@ -1,4 +1,4 @@
-const API = "https://script.google.com/macros/s/AKfycbwNUBe8KUQoNaQi0jHWnlonqhA1uTEv_4HDnBMpNfAwY24sRzL8K49s-74T25Eka4yX/exec";
+const API = "https://script.google.com/macros/s/AKfycbx13yQl4UHkHzgEymfCbtCt6W4xHQyTccAC8fnuAWILBzv2e8JZcQgS2NZ1hpKbgSLr/exec";
 
 const COP = new Intl.NumberFormat("es-CO", {
   style: "currency",
@@ -57,6 +57,27 @@ function formatHoursValue(value){
 
 function showPremiumModal(options = {}){
   return premiumModal.fire(options);
+}
+
+function getWorkerHourlyRate(worker = {}){
+  const candidates = [
+    worker.hourly_rate,
+    worker.hourlyRateRaw,
+    worker.workerHourlyRate
+  ];
+
+  for (const candidate of candidates){
+    if (candidate === "" || candidate === null || candidate === undefined){
+      continue;
+    }
+
+    const numericValue = Number(candidate);
+    if (Number.isFinite(numericValue) && numericValue > 0){
+      return numericValue;
+    }
+  }
+
+  return null;
 }
 
 function escapeHTML(value){
@@ -139,13 +160,12 @@ function renderMultiWorkerList(workers = []){
   multiWorkerList.innerHTML = validWorkers.map(worker => {
     const workerId = String(worker.id);
     const workerName = escapeHTML(worker.name || "Sin nombre");
-    const statusLabel = worker.active ? "En turno" : "Disponible";
     const checkedAttribute = selectedBatchWorkers.has(workerId) ? "checked" : "";
 
     return `
       <label class="multi-worker-item">
         <input type="checkbox" class="multi-worker-check" data-worker-id="${escapeHTML(workerId)}" ${checkedAttribute}>
-        <span>${workerName} - ${statusLabel}</span>
+        <span>${workerName}</span>
       </label>
     `;
   }).join("");
@@ -155,6 +175,100 @@ function renderMultiWorkerList(workers = []){
       const target = event.currentTarget;
       handleBatchWorkerToggle(target.dataset.workerId, target.checked);
     });
+  });
+}
+
+async function openAttendanceOverviewModal(){
+  setGlobalLoader(true, {
+    title: "Actualizando turnos",
+    text: "Estamos consultando el estado actual de los trabajadores."
+  });
+
+  let workers = currentWorkers;
+
+  try {
+    workers = await getWorkersData();
+    renderWorkers(workers);
+  } finally {
+    setGlobalLoader(false);
+  }
+
+  const validWorkers = Array.isArray(workers) ? workers : [];
+  const activeCount = validWorkers.filter(worker => parseWorkerActiveState(worker.active)).length;
+  const inactiveCount = Math.max(validWorkers.length - activeCount, 0);
+  const renderOverviewItems = filter => {
+    const filteredWorkers = validWorkers.filter(worker => {
+      const isActive = parseWorkerActiveState(worker.active);
+      if (filter === "active"){
+        return isActive;
+      }
+      if (filter === "inactive"){
+        return !isActive;
+      }
+      return true;
+    });
+
+    return filteredWorkers.length
+      ? filteredWorkers.map(worker => {
+          const isActive = parseWorkerActiveState(worker.active);
+          return `
+            <div class="attendance-overview-item">
+              <span>${escapeHTML(worker.name || "Sin nombre")}</span>
+              ${isActive
+                ? `<strong class="attendance-status-in">EN TURNO</strong>`
+                : `<strong class="attendance-status-out">FUERA DE TURNO</strong>`}
+            </div>
+          `;
+        }).join("")
+      : `<div class="attendance-overview-empty">No hay trabajadores para este filtro.</div>`;
+  };
+
+  await showPremiumModal({
+    title: "Vista general de turnos",
+    html: `
+      <div class="attendance-overview-modal">
+        <div class="attendance-overview-summary">
+          <button class="attendance-overview-kpi" type="button" data-filter="active">
+            <span>En turno</span>
+            <strong>${activeCount}</strong>
+          </button>
+          <button class="attendance-overview-kpi" type="button" data-filter="inactive">
+            <span>Fuera de turno</span>
+            <strong>${inactiveCount}</strong>
+          </button>
+        </div>
+
+        <div class="attendance-overview-list" id="attendanceOverviewList">
+          ${validWorkers.length ? renderOverviewItems("all") : `<div class="attendance-overview-empty">No hay trabajadores disponibles.</div>`}
+        </div>
+      </div>
+    `,
+    confirmButtonText: "Entendido",
+    didOpen: () => {
+      const overviewList = document.getElementById("attendanceOverviewList");
+      const filterButtons = document.querySelectorAll(".attendance-overview-kpi");
+      let selectedFilter = "all";
+
+      filterButtons.forEach(button => {
+        button.addEventListener("click", () => {
+          const nextFilter = button.dataset.filter || "all";
+          selectedFilter = selectedFilter === nextFilter ? "all" : nextFilter;
+
+          filterButtons.forEach(filterButton => {
+            filterButton.classList.toggle(
+              "selected",
+              selectedFilter !== "all" && filterButton.dataset.filter === selectedFilter
+            );
+          });
+
+          if (overviewList){
+            overviewList.innerHTML = validWorkers.length
+              ? renderOverviewItems(selectedFilter)
+              : `<div class="attendance-overview-empty">No hay trabajadores disponibles.</div>`;
+          }
+        });
+      });
+    }
   });
 }
 
@@ -362,7 +476,12 @@ async function api(action, data = {}){
     body: JSON.stringify({ action, ...data })
   });
 
-  return res.json();
+  const rawResponse = await res.text();
+  if (!rawResponse || rawResponse.trim() === "" || rawResponse.trim() === "undefined"){
+    return {};
+  }
+
+  return JSON.parse(rawResponse);
 }
 
 async function addWorker(){
@@ -388,6 +507,8 @@ async function addWorker(){
     text: "Estamos registrando al trabajador y actualizando la vista."
   });
 
+  let shouldShowSuccess = false;
+
   try {
     const result = await api("addWorker", payload);
     nameInput.value = "";
@@ -405,13 +526,17 @@ async function addWorker(){
     });
     await loadDashboard();
 
-    showPremiumModal({
-      icon: "success",
-      title: "Trabajador guardado",
-      text: `${payload.name} ya aparece en la lista actualizada.`
-    });
+    shouldShowSuccess = true;
   } finally {
     setGlobalLoader(false);
+  }
+
+  if (shouldShowSuccess){
+    await wait(80);
+    await showPremiumModal({
+      icon: "success",
+      title: "Cambio exitoso"
+    });
   }
 }
 
@@ -434,6 +559,10 @@ function renderWorkers(workers = currentWorkers){
     const progress = Math.min((worker.hours / maxHours) * 100, 100);
     const money = formatCOP(worker.pay || 0);
     const safeWorkerName = escapeHTML(worker.name || "Sin nombre");
+    const workerRate = getWorkerHourlyRate(worker);
+    const rateTitle = workerRate
+      ? `Tarifa individual: ${formatCOP(workerRate)}`
+      : "Configurar tarifa individual";
     const liqDate = worker.lastLiquidation
       ? new Date(worker.lastLiquidation).toLocaleDateString("es-CO", {
           weekday: "short",
@@ -470,6 +599,7 @@ function renderWorkers(workers = currentWorkers){
         <div class="worker-header">
           <div class="worker-name-row">
             <span class="worker-name">${safeWorkerName}</span>
+            <button class="worker-rate-btn" type="button" onclick="openWorkerRateModal('${worker.id}')" aria-label="Configurar tarifa por hora" title="${escapeHTML(rateTitle)}">$</button>
             <button class="edit-worker-btn" type="button" onclick="editWorker('${worker.id}')" aria-label="Editar trabajador">&#9998;</button>
           </div>
           <span>${money}</span>
@@ -689,10 +819,114 @@ async function editWorker(id, currentName, currentPhone, currentEmail){
     setGlobalLoader(false);
   }
 
+  await wait(80);
   await showPremiumModal({
     icon: "success",
-    title: "Cambios guardados",
-    text: `${value.name} fue actualizado correctamente.`
+    title: "Cambio exitoso"
+  });
+}
+
+async function openWorkerRateModal(id){
+  const workerId = String(id || "").trim();
+  if (!workerId){
+    showPremiumModal({
+      icon: "warning",
+      title: "Trabajador no valido",
+      text: "No se pudo identificar el trabajador para configurar la tarifa."
+    });
+    return;
+  }
+
+  const workerData = currentWorkers.find(worker => String(worker.id) === workerId) || {};
+  const workerName = workerData.name || "Trabajador";
+  const currentRate = getWorkerHourlyRate(workerData);
+  const rateHint = currentRate
+    ? `Tarifa actual: ${formatCOP(currentRate)}`
+    : "Usando tarifa global";
+
+  const { isConfirmed, value } = await showPremiumModal({
+    title: "Configurar tarifa por hora",
+    html: `
+      <div class="worker-rate-modal">
+        <div class="worker-rate-context">
+          <span>Trabajador</span>
+          <strong>${escapeHTML(workerName)}</strong>
+        </div>
+
+        <label class="apple-modal-field">
+          <span>Valor por hora</span>
+          <input id="swalWorkerRate" class="apple-modal-input-field" type="number" inputmode="numeric" min="1" step="1" value="${currentRate ?? ""}" placeholder="Ej: 10000">
+        </label>
+
+        <p class="worker-rate-hint">${rateHint}</p>
+      </div>
+    `,
+    confirmButtonText: "Guardar",
+    showCancelButton: true,
+    cancelButtonText: "Cancelar",
+    focusConfirm: false,
+    customClass: {
+      popup: "apple-modal",
+      title: "apple-modal-title",
+      htmlContainer: "apple-modal-text",
+      actions: "apple-modal-actions",
+      confirmButton: "apple-modal-btn worker-rate-save-btn",
+      cancelButton: "apple-modal-btn apple-modal-btn-secondary"
+    },
+    didOpen: () => {
+      const rateInput = document.getElementById("swalWorkerRate");
+      if (rateInput){
+        rateInput.focus();
+        rateInput.select();
+      }
+    },
+    preConfirm: () => {
+      const rateInput = document.getElementById("swalWorkerRate");
+      const numericRate = Number(rateInput?.value || 0);
+
+      if (!Number.isFinite(numericRate) || numericRate <= 0){
+        Swal.showValidationMessage("Ingresa una tarifa mayor a cero.");
+        return false;
+      }
+
+      return Math.round(numericRate);
+    }
+  });
+
+  if (!isConfirmed || !value){
+    return;
+  }
+
+  setGlobalLoader(true, {
+    title: "Guardando tarifa",
+    text: "Estamos actualizando el valor por hora del trabajador."
+  });
+
+  try {
+    await api("setWorkerRate", {
+      worker: workerId,
+      rate: value
+    });
+
+    currentWorkers = currentWorkers.map(worker =>
+      String(worker.id) === workerId
+        ? { ...worker, hourly_rate: value, hourlyRate: value }
+        : worker
+    );
+    renderWorkers(currentWorkers);
+
+    await loadWorkers();
+    if (adminUnlocked){
+      await loadDashboard();
+    }
+  } finally {
+    setGlobalLoader(false);
+  }
+
+  await showPremiumModal({
+    icon: "success",
+    title: "Tarifa guardada",
+    text: `${workerName} ahora tiene una tarifa de ${formatCOP(value)} por hora.`
   });
 }
 
@@ -1332,6 +1566,7 @@ function normalizeWorker(worker = {}){
     name: worker.name || "Sin nombre",
     phone: worker.phone || "",
     email: worker.email || "",
+    hourly_rate: getWorkerHourlyRate(worker),
     hours: Number(worker.hours || 0),
     pay: Number(worker.pay || 0),
     days: Number(worker.days || 0),
@@ -1774,7 +2009,7 @@ async function loadTimeLogs({ showLoader = true } = {}){
         : "Pendiente";
 
       const status = outDate
-        ? `<div class="status-ok">OK</div>`
+        ? `<div class="status-out">FUERA DE TURNO</div>`
         : `<span class="active-dot">EN TURNO</span>`;
 
       return `
