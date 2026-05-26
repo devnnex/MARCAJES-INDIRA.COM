@@ -1,4 +1,4 @@
-const API = "https://script.google.com/macros/s/AKfycbxpAuPaFfAPNR-0m5y7yD8CCOcAmDCy8UoXX_y7KWsfzXgf8lrgiNfd3aYSVRrQ3HBO/exec";
+const API = "https://script.google.com/macros/s/AKfycbwJS1riWJCMG19GlA9TmF6NKtM5-KvQmNzofrEfEjwxiZrV_bY0SHl7WS5PKdUD5u5r/exec";
 
 const COP = new Intl.NumberFormat("es-CO", {
   style: "currency",
@@ -1134,7 +1134,7 @@ function buildBatchAttendanceRows(results, maxRows = 8){
   const rows = visibleRows.map(result => `
     <div class="apple-liquidation-row">
       <span>${escapeHTML(result.name || getWorkerNameById(result.workerId))}</span>
-      <strong>${formatAttendanceTime(result.time)}</strong>
+      <strong>${result.confirmedByState ? "Confirmado" : formatAttendanceTime(result.time)}</strong>
     </div>
   `).join("");
 
@@ -1158,7 +1158,79 @@ function isRetryableAttendanceError(error){
     ? error
     : String(error.message || error.name || "");
 
-  return /network|fetch|timeout|429|5\d\d|tempor|limit|quota|rate/i.test(message);
+  return /network|fetch|timeout|timed out|429|5\d\d|tempor|limit|quota|rate|lock|busy|concurr|service|unavailable|execution/i.test(message);
+}
+
+function createAttendanceOperationId(action, workerId){
+  const randomPart = Math.random().toString(36).slice(2, 10);
+  return `${action}-${String(workerId)}-${Date.now().toString(36)}-${randomPart}`;
+}
+
+function getAttendanceOperationId(operationIdsByWorkerId, workerId){
+  return operationIdsByWorkerId?.get(String(workerId)) || "";
+}
+
+function getAttendanceOperationIdsPayload(workerIds, operationIdsByWorkerId){
+  return workerIds.reduce((operationIds, workerId) => {
+    const operationId = getAttendanceOperationId(operationIdsByWorkerId, workerId);
+    if (operationId){
+      operationIds[String(workerId)] = operationId;
+    }
+
+    return operationIds;
+  }, {});
+}
+
+function getAttendanceResultError(result){
+  if (!result){
+    return null;
+  }
+
+  if (result.status === "fulfilled"){
+    return result.value?.error || null;
+  }
+
+  return result.reason || null;
+}
+
+function isSuccessfulAttendanceResult(result){
+  return result?.status === "fulfilled" && !result.value?.error;
+}
+
+function isRetryableAttendanceResult(result){
+  return isRetryableAttendanceError(getAttendanceResultError(result));
+}
+
+function shouldPromoteConfirmedAttendanceResult(action, workerId, result, initialActiveStateByWorkerId){
+  if (isSuccessfulAttendanceResult(result)){
+    return true;
+  }
+
+  if (isRetryableAttendanceResult(result)){
+    return true;
+  }
+
+  const expectedActive = action === "checkIn";
+  const initialActive = initialActiveStateByWorkerId?.get(String(workerId));
+  return initialActive !== expectedActive;
+}
+
+function createConfirmedAttendanceResult(action, workerId, originalResult){
+  const originalPayload = originalResult?.status === "fulfilled" && !originalResult.value?.error
+    ? originalResult.value
+    : {};
+
+  return {
+    status: "fulfilled",
+    value: {
+      ...originalPayload,
+      type: action === "checkIn" ? "IN" : "OUT",
+      workerId,
+      name: originalPayload.name || getWorkerNameById(workerId),
+      time: originalPayload.time || new Date().toISOString(),
+      confirmedByState: true
+    }
+  };
 }
 
 function parseWorkerActiveState(activeValue){
@@ -1185,16 +1257,37 @@ function parseWorkerActiveState(activeValue){
 
 async function executeAttendanceBatch(action, selectedWorkerIds, {
   maxAttempts = 3,
-  retryDelayMs = 180
+  retryDelayMs = 180,
+  operationIdsByWorkerId = new Map()
 } = {}){
   const idsInOrder = [...selectedWorkerIds];
   const resultsByWorkerId = new Map();
   let pendingIds = [...idsInOrder];
 
   for (let attempt = 1; attempt <= maxAttempts && pendingIds.length; attempt += 1){
-    const waveResults = await Promise.allSettled(
-      pendingIds.map(workerId => api(action, { worker: workerId }))
-    );
+    let waveResults = [];
+
+    try {
+      const batchPayload = await api(`${action}Batch`, {
+        workers: pendingIds,
+        operationIds: getAttendanceOperationIdsPayload(pendingIds, operationIdsByWorkerId)
+      });
+
+      if (!batchPayload?.error && Array.isArray(batchPayload?.results)){
+        waveResults = batchPayload.results.map(value => ({ status: "fulfilled", value }));
+      } else if (/accion no reconocida/i.test(String(batchPayload?.message || ""))){
+        waveResults = await Promise.allSettled(
+          pendingIds.map(workerId => api(action, {
+            worker: workerId,
+            operationId: getAttendanceOperationId(operationIdsByWorkerId, workerId)
+          }))
+        );
+      } else {
+        waveResults = pendingIds.map(() => ({ status: "fulfilled", value: batchPayload }));
+      }
+    } catch (error){
+      waveResults = pendingIds.map(() => ({ status: "rejected", reason: error }));
+    }
 
     const retryIds = [];
 
@@ -1266,7 +1359,9 @@ async function getUnconfirmedAttendanceWorkerIds(action, workerIds, {
 
 async function ensureAttendanceBatchCompletion(action, selectedWorkerIds, settledResults, {
   maxVerifyAttempts = 3,
-  verifyDelayMs = 260
+  verifyDelayMs = 260,
+  operationIdsByWorkerId = new Map(),
+  initialActiveStateByWorkerId = new Map()
 } = {}){
   const idsInOrder = selectedWorkerIds.map(workerId => String(workerId));
   const resultsByWorkerId = new Map(
@@ -1279,7 +1374,16 @@ async function ensureAttendanceBatchCompletion(action, selectedWorkerIds, settle
   });
 
   if (!unconfirmedIds.length){
-    return idsInOrder.map(workerId => resultsByWorkerId.get(workerId));
+    return idsInOrder.map(workerId => {
+      const result = resultsByWorkerId.get(workerId);
+      if (isSuccessfulAttendanceResult(result)){
+        return result;
+      }
+
+      return shouldPromoteConfirmedAttendanceResult(action, workerId, result, initialActiveStateByWorkerId)
+        ? createConfirmedAttendanceResult(action, workerId, result)
+        : result;
+    });
   }
 
   setGlobalLoader(true, {
@@ -1290,6 +1394,7 @@ async function ensureAttendanceBatchCompletion(action, selectedWorkerIds, settle
   const retryResults = await executeAttendanceBatchSequential(action, unconfirmedIds, {
     maxAttempts: 3,
     retryDelayMs: 150,
+    operationIdsByWorkerId,
     onProgress: ({ current, total, workerName }) => {
       setGlobalLoader(true, {
         title: "Reintentando marcajes",
@@ -1305,6 +1410,21 @@ async function ensureAttendanceBatchCompletion(action, selectedWorkerIds, settle
   unconfirmedIds = await getUnconfirmedAttendanceWorkerIds(action, unconfirmedIds, {
     attempts: maxVerifyAttempts,
     delayMs: verifyDelayMs
+  });
+
+  const stillUnconfirmedIds = new Set(unconfirmedIds.map(workerId => String(workerId)));
+
+  idsInOrder.forEach(workerId => {
+    if (stillUnconfirmedIds.has(workerId)){
+      return;
+    }
+
+    const result = resultsByWorkerId.get(workerId);
+    if (isSuccessfulAttendanceResult(result) || !shouldPromoteConfirmedAttendanceResult(action, workerId, result, initialActiveStateByWorkerId)){
+      return;
+    }
+
+    resultsByWorkerId.set(workerId, createConfirmedAttendanceResult(action, workerId, result));
   });
 
   unconfirmedIds.forEach(workerId => {
@@ -1345,7 +1465,8 @@ function buildAttendanceSummary(settledResults, selectedWorkerIds){
       workerId,
       name: payload.name || fallbackName,
       time: payload.time,
-      earned: Number(payload.earned || 0)
+      earned: Number(payload.earned || 0),
+      confirmedByState: Boolean(payload.confirmedByState)
     });
   });
 
@@ -1378,6 +1499,7 @@ function applyOptimisticAttendanceState(results, isActive){
 async function executeAttendanceBatchSequential(action, selectedWorkerIds, {
   maxAttempts = 2,
   retryDelayMs = 90,
+  operationIdsByWorkerId = new Map(),
   onProgress = null
 } = {}){
   const settledResults = [];
@@ -1400,7 +1522,10 @@ async function executeAttendanceBatchSequential(action, selectedWorkerIds, {
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1){
       try {
-        const payload = await api(action, { worker: workerId });
+        const payload = await api(action, {
+          worker: workerId,
+          operationId: getAttendanceOperationId(operationIdsByWorkerId, workerId)
+        });
         finalResult = { status: "fulfilled", value: payload };
 
         if (!payload?.error){
@@ -1431,6 +1556,18 @@ async function executeAttendanceBatchSequential(action, selectedWorkerIds, {
 async function registerAttendance(action){
   const isCheckIn = action === "checkIn";
   const selectedWorkerIds = getSelectedAttendanceWorkerIds();
+  const initialActiveStateByWorkerId = new Map(
+    currentWorkers.map(worker => [
+      String(worker.id),
+      parseWorkerActiveState(worker.active)
+    ])
+  );
+  const operationIdsByWorkerId = new Map(
+    selectedWorkerIds.map(workerId => [
+      String(workerId),
+      createAttendanceOperationId(action, workerId)
+    ])
+  );
 
   if (!selectedWorkerIds.length){
     showPremiumModal({
@@ -1456,6 +1593,7 @@ async function registerAttendance(action){
       settledResults = await executeAttendanceBatchSequential(action, selectedWorkerIds, {
         maxAttempts: 2,
         retryDelayMs: 90,
+        operationIdsByWorkerId,
         onProgress: ({ current, total, workerName }) => {
           setGlobalLoader(true, {
             title: isCheckIn ? "Registrando entradas" : "Registrando salidas",
@@ -1470,11 +1608,15 @@ async function registerAttendance(action){
       });
       settledResults = await executeAttendanceBatch(action, selectedWorkerIds, {
         maxAttempts: 2,
-        retryDelayMs: 120
+        retryDelayMs: 120,
+        operationIdsByWorkerId
       });
     }
 
-    settledResults = await ensureAttendanceBatchCompletion(action, selectedWorkerIds, settledResults);
+    settledResults = await ensureAttendanceBatchCompletion(action, selectedWorkerIds, settledResults, {
+      operationIdsByWorkerId,
+      initialActiveStateByWorkerId
+    });
   } finally {
     setGlobalLoader(false);
   }
@@ -1497,11 +1639,12 @@ async function registerAttendance(action){
       icon: "success",
       title: result.name,
       text: isCheckIn
-        ? `Entrada registrada ${formatAttendanceTime(result.time)}`
-        : `Salida registrada ${formatAttendanceTime(result.time)} - Ganado ${formatCOP(result.earned)}`
+        ? (result.confirmedByState ? "Entrada confirmada" : `Entrada registrada ${formatAttendanceTime(result.time)}`)
+        : (result.confirmedByState ? "Salida confirmada" : `Salida registrada ${formatAttendanceTime(result.time)} - Ganado ${formatCOP(result.earned)}`)
     });
   } else {
     const totalEarned = successResults.reduce((sum, result) => sum + Number(result.earned || 0), 0);
+    const hasStateConfirmedCheckout = !isCheckIn && successResults.some(result => result.confirmedByState);
 
     showPremiumModal({
       icon: failedResults.length ? "warning" : "success",
@@ -1509,7 +1652,7 @@ async function registerAttendance(action){
       html: `
         <div class="apple-liquidation-summary">
           <div class="apple-liquidation-row"><span>Registros exitosos</span><strong>${successResults.length}</strong></div>
-          ${isCheckIn ? "" : `<div class="apple-liquidation-row"><span>Total ganado</span><strong>${formatCOP(totalEarned)}</strong></div>`}
+          ${isCheckIn || hasStateConfirmedCheckout ? "" : `<div class="apple-liquidation-row"><span>Total ganado</span><strong>${formatCOP(totalEarned)}</strong></div>`}
           ${failedResults.length ? `<div class="apple-liquidation-row"><span>Sin registrar</span><strong>${failedResults.length}</strong></div>` : ""}
           ${buildBatchAttendanceRows(successResults)}
         </div>
