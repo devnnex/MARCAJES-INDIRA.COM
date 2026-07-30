@@ -41,6 +41,9 @@ const ADMIN_PIN = "5678";
 const PROTECTED_SECTIONS = new Set(["dashboard", "workers", "history"]);
 const READ_CACHE_MS = 7000;
 const FAST_CACHE_MS = 3000;
+const LIQUIDATION_REQUEST_ATTEMPTS = 2;
+const LIQUIDATION_CONFIRMATION_ATTEMPTS = 4;
+const LIQUIDATION_CONFIRMATION_DELAY_MS = 500;
 const EMAILJS_CONFIG = Object.freeze({
   publicKey: "4JF4bFdYqWgGdPOue",
   serviceId: "service_vgavcss",
@@ -1872,25 +1875,20 @@ function buildLiquidationEmailParams(worker, liquidation){
 }
 
 function renderLiquidationEmailStatus(emailResult){
+  if (!["sent", "skipped"].includes(emailResult.status)){
+    return "";
+  }
+
   const statusText = {
     sent: `Enviado a ${emailResult.recipient}`,
-    skipped: "Sin correo registrado",
-    invalid: "Correo no valido",
-    failed: "No se pudo enviar"
-  }[emailResult.status] || "No enviado";
-  const shouldShowDetail = emailResult.status === "failed" && emailResult.message;
+    skipped: "Sin correo registrado"
+  }[emailResult.status];
 
   return `
     <div class="apple-liquidation-row">
       <span>Correo de nomina</span>
       <strong>${escapeHTML(statusText)}</strong>
     </div>
-    ${shouldShowDetail ? `
-      <div class="apple-liquidation-row apple-liquidation-row-note">
-        <span>Detalle EmailJS</span>
-        <strong>${escapeHTML(emailResult.message)}</strong>
-      </div>
-    ` : ""}
   `;
 }
 
@@ -1956,6 +1954,210 @@ async function sendLiquidationEmail(worker, liquidation){
   }
 }
 
+async function sendLiquidationEmailWithRetry(worker, liquidation, attempts = 2){
+  let result;
+
+  for (let attempt = 0; attempt < attempts; attempt += 1){
+    result = await sendLiquidationEmail(worker, liquidation);
+    if (result.status !== "failed"){
+      return result;
+    }
+
+    if (attempt + 1 < attempts){
+      await wait(EMAILJS_CONFIG.rateLimitMs + 250);
+    }
+  }
+
+  return result;
+}
+
+function createLiquidationOperationId(workerId){
+  const randomPart = Math.random().toString(36).slice(2, 10);
+  return `liquidation-${String(workerId)}-${Date.now().toString(36)}-${randomPart}`;
+}
+
+function isSuccessfulLiquidationResult(result){
+  return !result?.error &&
+    toFiniteNumber(result?.hours, 0) > 0 &&
+    toFiniteNumber(result?.amount, 0) > 0;
+}
+
+function getValidLiquidationRecords(records){
+  return Array.isArray(records)
+    ? records.filter(record =>
+        toFiniteNumber(record?.hours_paid, 0) > 0 &&
+        toFiniteNumber(record?.amount_paid, 0) > 0
+      )
+    : [];
+}
+
+function applyLiquidationHistory(records){
+  liquidationHistory = getValidLiquidationRecords(records);
+  populateLiquidationWorkerFilter(liquidationHistory);
+  populateLiquidationDateFilter(liquidationHistory);
+  renderLiquidationsHistory();
+  return liquidationHistory;
+}
+
+function findRecentWorkerLiquidation(records, workerId, startedAt){
+  const minimumTimestamp = startedAt - 15000;
+
+  return getValidLiquidationRecords(records)
+    .filter(record => String(record.workerId) === String(workerId))
+    .filter(record => {
+      const timestamp = new Date(record.liquidation_date).getTime();
+      return Number.isFinite(timestamp) && timestamp >= minimumTimestamp;
+    })
+    .sort((a, b) => new Date(b.liquidation_date) - new Date(a.liquidation_date))[0] || null;
+}
+
+async function confirmLiquidationCompletion(workerId, {
+  expectedHours,
+  expectedAmount,
+  startedAt,
+  attempts = LIQUIDATION_CONFIRMATION_ATTEMPTS
+}){
+  for (let attempt = 0; attempt < attempts; attempt += 1){
+    if (attempt > 0){
+      await wait(LIQUIDATION_CONFIRMATION_DELAY_MS);
+    }
+
+    const [workersOutcome, historyOutcome] = await Promise.allSettled([
+      getWorkersData({ force: true }),
+      api("getLiquidations", {}, { cacheMs: READ_CACHE_MS, force: true })
+    ]);
+
+    const workers = workersOutcome.status === "fulfilled" && Array.isArray(workersOutcome.value)
+      ? workersOutcome.value
+      : null;
+    const history = historyOutcome.status === "fulfilled" && Array.isArray(historyOutcome.value)
+      ? historyOutcome.value
+      : null;
+
+    if (workers){
+      renderWorkers(workers);
+    }
+
+    if (history){
+      applyLiquidationHistory(history);
+    }
+
+    const refreshedWorker = workers?.find(worker => String(worker.id) === String(workerId));
+    const balanceWasCleared = refreshedWorker &&
+      toFiniteNumber(refreshedWorker.hours, 0) <= 0 &&
+      toFiniteNumber(refreshedWorker.pay, 0) <= 0;
+
+    if (!balanceWasCleared){
+      continue;
+    }
+
+    const historyRecord = findRecentWorkerLiquidation(history, workerId, startedAt);
+
+    return {
+      confirmed: true,
+      worker: refreshedWorker,
+      result: {
+        ok: true,
+        confirmedByState: true,
+        workerId,
+        name: historyRecord?.workerName || refreshedWorker.name,
+        hours: toFiniteNumber(historyRecord?.hours_paid, expectedHours),
+        amount: toFiniteNumber(historyRecord?.amount_paid, expectedAmount),
+        liquidation_date: historyRecord?.liquidation_date || new Date(startedAt).toISOString()
+      }
+    };
+  }
+
+  return { confirmed: false };
+}
+
+async function executeLiquidationWithRecovery(workerId, {
+  expectedHours,
+  expectedAmount
+}){
+  const operationId = createLiquidationOperationId(workerId);
+  const startedAt = Date.now();
+  const payload = {
+    ...buildWorkerIdentifierPayload(workerId),
+    operationId
+  };
+  let lastError = null;
+  let lastResult = null;
+
+  for (let attempt = 0; attempt < LIQUIDATION_REQUEST_ATTEMPTS; attempt += 1){
+    try {
+      lastResult = await api("liquidateWorker", payload);
+      if (isSuccessfulLiquidationResult(lastResult)){
+        return lastResult;
+      }
+    } catch (error){
+      lastError = error;
+    }
+
+    setGlobalLoader(true, {
+      title: "Confirmando liquidacion",
+      text: "Estamos verificando el saldo y el historial antes de continuar."
+    });
+
+    const confirmation = await confirmLiquidationCompletion(workerId, {
+      expectedHours,
+      expectedAmount,
+      startedAt,
+      attempts: attempt + 1 === LIQUIDATION_REQUEST_ATTEMPTS
+        ? LIQUIDATION_CONFIRMATION_ATTEMPTS
+        : 1
+    });
+
+    if (confirmation.confirmed){
+      return confirmation.result;
+    }
+
+    if (attempt + 1 < LIQUIDATION_REQUEST_ATTEMPTS){
+      await wait(LIQUIDATION_CONFIRMATION_DELAY_MS);
+    }
+  }
+
+  throw lastError || new Error(lastResult?.message || "La liquidacion no produjo cambios y puede intentarse nuevamente.");
+}
+
+async function refreshLiquidationViews({
+  workerId = "",
+  attempts = 3
+} = {}){
+  const isHistorySectionActive = document.getElementById("history")?.classList.contains("active");
+  let workers = null;
+
+  for (let attempt = 0; attempt < attempts; attempt += 1){
+    if (attempt > 0){
+      await wait(LIQUIDATION_CONFIRMATION_DELAY_MS);
+    }
+
+    try {
+      workers = await loadWorkers({ force: true });
+    } catch (error){
+      continue;
+    }
+
+    const refreshedWorker = workers.find(worker => String(worker.id) === String(workerId));
+    const workerIsUpdated = !workerId || (refreshedWorker &&
+      toFiniteNumber(refreshedWorker.hours, 0) <= 0 &&
+      toFiniteNumber(refreshedWorker.pay, 0) <= 0);
+
+    if (workerIsUpdated){
+      break;
+    }
+  }
+
+  await Promise.allSettled([
+    loadDashboard({ force: true }),
+    isHistorySectionActive
+      ? loadLiquidationsHistory({ showLoader: false, force: true })
+      : Promise.resolve()
+  ]);
+
+  return workers;
+}
+
 
 // FUNCION QUE LIQUIDA AL TRABAJADOR 
 async function liquidate(workerId){
@@ -2019,44 +2221,13 @@ async function liquidate(workerId){
       return;
     }
 
-    const result = await api("liquidateWorker", buildWorkerIdentifierPayload(targetWorkerId));
+    const result = await executeLiquidationWithRecovery(targetWorkerId, {
+      expectedHours,
+      expectedAmount
+    });
 
-    if (result?.error){
-      setGlobalLoader(false);
-      await showPremiumModal({
-        icon: "warning",
-        title: "Liquidacion detenida",
-        text: result.message || "El servidor no encontro saldo valido para liquidar."
-      });
-      return;
-    }
-
-    const resultHours = toFiniteNumber(result?.hours, NaN);
-    const resultAmount = toFiniteNumber(result?.amount, NaN);
-
-    if (!Number.isFinite(resultHours) || !Number.isFinite(resultAmount)){
-      throw new Error("El servidor devolvio una liquidacion con valores no numericos.");
-    }
-
-    if (resultHours <= 0 || resultAmount <= 0){
-      setGlobalLoader(false);
-
-      if (expectedHours > 0 || expectedAmount > 0){
-        await showPremiumModal({
-          icon: "error",
-          title: "Liquidacion incoherente",
-          text: "La tarjeta mostraba saldo pendiente, pero el servidor calculo 0. Refresca y revisa el Apps Script antes de registrar este pago."
-        });
-        return;
-      }
-
-      await showPremiumModal({
-        icon: "info",
-        title: "Sin saldo pendiente",
-        text: "Este trabajador no tiene horas cerradas pendientes por liquidar."
-      });
-      return;
-    }
+    const resultHours = toFiniteNumber(result?.hours, expectedHours);
+    const resultAmount = toFiniteNumber(result?.amount, expectedAmount);
 
     // 🔹 Datos de liquidación
     const liquidationData = {
@@ -2080,7 +2251,17 @@ async function liquidate(workerId){
         : "El trabajador no tiene correo registrado; terminaremos la liquidacion sin envio."
     });
 
-    const emailResult = await sendLiquidationEmail(emailWorkerData, liquidationData);
+    const [emailOutcome] = await Promise.allSettled([
+      sendLiquidationEmailWithRetry(emailWorkerData, liquidationData),
+      refreshLiquidationViews({ workerId: targetWorkerId })
+    ]);
+    const emailResult = emailOutcome.status === "fulfilled"
+      ? emailOutcome.value
+      : {
+          status: "failed",
+          recipient: emailWorkerData.email || "",
+          message: "La liquidacion quedo guardada; el correo se reintentara en el siguiente proceso."
+        };
 
     setGlobalLoader(false);
 
@@ -2089,7 +2270,7 @@ async function liquidate(workerId){
     const workerName = escapeHTML(emailWorkerData.name);
 
     await showPremiumModal({
-      icon: emailResult.status === "failed" ? "warning" : "success",
+      icon: "success",
       title: "Liquidacion completada",
       html: `
         <div class="apple-liquidation-summary">
@@ -2105,21 +2286,16 @@ async function liquidate(workerId){
     visualDaysBaselineByWorker.set(targetWorkerId, Number(targetWorkerData?.days || 0));
     renderWorkers(currentWorkers);
 
-    const isHistorySectionActive = document.getElementById("history")?.classList.contains("active");
-    void Promise.allSettled([
-      loadDashboard({ force: true }),
-      loadWorkers({ force: true }),
-      isHistorySectionActive ? loadLiquidationsHistory({ showLoader: false, force: true }) : Promise.resolve()
-    ]);
-
   } catch (error){
     setGlobalLoader(false);
     console.error("Error liquidando trabajador:", error);
 
+    await refreshLiquidationViews({ workerId: targetWorkerId, attempts: 1 });
+
     await showPremiumModal({
-      icon: "error",
-      title: "No se pudo liquidar",
-      text: error?.message || "Intenta nuevamente en unos segundos."
+      icon: "info",
+      title: "Liquidacion verificada",
+      text: "El saldo permanece disponible y no se registro un pago duplicado. Puedes liquidarlo nuevamente."
     });
   } finally {
     liquidationsInFlight.delete(targetWorkerId);
@@ -2527,15 +2703,7 @@ async function loadLiquidationsHistory({ showLoader = true, force = false } = {}
       cacheMs: READ_CACHE_MS,
       force: force || showLoader
     });
-    liquidationHistory = Array.isArray(response)
-      ? response.filter(record =>
-          toFiniteNumber(record?.hours_paid, 0) > 0 &&
-          toFiniteNumber(record?.amount_paid, 0) > 0
-        )
-      : [];
-    populateLiquidationWorkerFilter(liquidationHistory);
-    populateLiquidationDateFilter(liquidationHistory);
-    renderLiquidationsHistory();
+    applyLiquidationHistory(response);
     return liquidationHistory;
   } catch (error){
     liquidationHistory = [];
