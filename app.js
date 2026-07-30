@@ -35,6 +35,7 @@ let liquidationHistory = [];
 const visualDaysBaselineByWorker = new Map();
 const readCache = new Map();
 const inFlightReads = new Map();
+const liquidationsInFlight = new Set();
 
 const ADMIN_PIN = "5678";
 const PROTECTED_SECTIONS = new Set(["dashboard", "workers", "history"]);
@@ -130,6 +131,16 @@ function isValidEmailAddress(value){
 function getWorkerNameById(workerId){
   const matchedWorker = currentWorkers.find(worker => String(worker.id) === String(workerId));
   return matchedWorker?.name || "Trabajador";
+}
+
+function buildWorkerIdentifierPayload(workerId){
+  const normalizedWorkerId = String(workerId ?? "").trim();
+
+  // Mantiene compatibilidad con los contratos anterior y actual del Apps Script.
+  return {
+    worker: normalizedWorkerId,
+    worker_id: normalizedWorkerId
+  };
 }
 
 function setAttendanceMode(mode = "single"){
@@ -790,9 +801,12 @@ function fillWorkerSelects(workers){
   liquidWorker.innerHTML = "";
 
   workers.forEach(worker => {
-    const option = `<option value="${worker.id}">${worker.name}</option>`;
-    workerSelect.innerHTML += option;
-    liquidWorker.innerHTML += option;
+    [workerSelect, liquidWorker].forEach(select => {
+      const option = document.createElement("option");
+      option.value = String(worker.id ?? "");
+      option.textContent = worker.name || "Sin nombre";
+      select.appendChild(option);
+    });
   });
 
   if (selectedWorker && workers.some(worker => String(worker.id) === String(selectedWorker))){
@@ -1726,11 +1740,31 @@ async function saveRate(){
   ]);
 }
 
+function normalizeDashboardData(dashboard){
+  if (!Array.isArray(dashboard)){
+    return dashboard && typeof dashboard === "object" ? dashboard : {};
+  }
+
+  const totals = dashboard.reduce((summary, worker) => {
+    summary.hours += toFiniteNumber(worker?.hours, 0);
+    summary.pay += toFiniteNumber(worker?.pay, 0);
+    return summary;
+  }, { hours: 0, pay: 0 });
+
+  return {
+    workers: dashboard.length,
+    hours: formatHoursValue(totals.hours),
+    pay: totals.pay,
+    rate: getRateFromDashboard(dashboard)
+  };
+}
+
 async function loadDashboard({ force = false } = {}){
-  const dashboard = await api("getDashboard", {}, {
+  const dashboardResponse = await api("getDashboard", {}, {
     cacheMs: FAST_CACHE_MS,
     force
   });
+  const dashboard = normalizeDashboardData(dashboardResponse);
 
   kpiWorkers.textContent = dashboard.workers;
   kpiHours.textContent = dashboard.hours;
@@ -1937,6 +1971,12 @@ async function liquidate(workerId){
     return;
   }
 
+  if (liquidationsInFlight.has(targetWorkerId)){
+    return;
+  }
+
+  liquidationsInFlight.add(targetWorkerId);
+
   let targetWorkerData = currentWorkers.find(
     worker => String(worker.id) === targetWorkerId
   );
@@ -1950,13 +1990,36 @@ async function liquidate(workerId){
     const freshWorkers = await getWorkersData({ force: true });
     renderWorkers(freshWorkers);
 
-    targetWorkerData = currentWorkers.find(
+    const freshTargetWorkerData = currentWorkers.find(
       worker => String(worker.id) === targetWorkerId
-    ) || targetWorkerData;
+    );
+
+    if (!freshTargetWorkerData){
+      setGlobalLoader(false);
+      await showPremiumModal({
+        icon: "warning",
+        title: "Trabajador no encontrado",
+        text: "El trabajador ya no esta disponible. Refresca la lista antes de continuar."
+      });
+      return;
+    }
+
+    targetWorkerData = freshTargetWorkerData;
 
     const expectedHours = toFiniteNumber(targetWorkerData?.hours, 0);
     const expectedAmount = toFiniteNumber(targetWorkerData?.pay, 0);
-    const result = await api("liquidateWorker", { worker: targetWorkerId });
+
+    if (expectedHours <= 0 || expectedAmount <= 0){
+      setGlobalLoader(false);
+      await showPremiumModal({
+        icon: "info",
+        title: "Sin saldo pendiente",
+        text: "Este trabajador no tiene horas cerradas pendientes por liquidar."
+      });
+      return;
+    }
+
+    const result = await api("liquidateWorker", buildWorkerIdentifierPayload(targetWorkerId));
 
     if (result?.error){
       setGlobalLoader(false);
@@ -2058,6 +2121,9 @@ async function liquidate(workerId){
       title: "No se pudo liquidar",
       text: error?.message || "Intenta nuevamente en unos segundos."
     });
+  } finally {
+    liquidationsInFlight.delete(targetWorkerId);
+    setGlobalLoader(false);
   }
 }
 
@@ -2105,6 +2171,25 @@ function normalizeWorker(worker = {}){
 function getRateFromDashboard(dashboard){
   if (!dashboard || typeof dashboard !== "object"){
     return null;
+  }
+
+  if (Array.isArray(dashboard)){
+    const rateFrequency = new Map();
+
+    dashboard.forEach(worker => {
+      const numericRate = Number(
+        worker?.hourlyRate ?? worker?.hourly_rate ?? worker?.workerHourlyRate
+      );
+
+      if (Number.isFinite(numericRate) && numericRate > 0){
+        rateFrequency.set(numericRate, (rateFrequency.get(numericRate) || 0) + 1);
+      }
+    });
+
+    const mostFrequentRate = [...rateFrequency.entries()]
+      .sort((a, b) => b[1] - a[1])[0];
+
+    return mostFrequentRate?.[0] ?? null;
   }
 
   const directCandidates = [
@@ -2442,7 +2527,12 @@ async function loadLiquidationsHistory({ showLoader = true, force = false } = {}
       cacheMs: READ_CACHE_MS,
       force: force || showLoader
     });
-    liquidationHistory = Array.isArray(response) ? response : [];
+    liquidationHistory = Array.isArray(response)
+      ? response.filter(record =>
+          toFiniteNumber(record?.hours_paid, 0) > 0 &&
+          toFiniteNumber(record?.amount_paid, 0) > 0
+        )
+      : [];
     populateLiquidationWorkerFilter(liquidationHistory);
     populateLiquidationDateFilter(liquidationHistory);
     renderLiquidationsHistory();
@@ -2525,7 +2615,7 @@ async function loadTimeLogs({ showLoader = true, force = false } = {}){
     });
 
     if (!logs.length){
-      timeLogsTable.innerHTML = `<tr><td colspan="4" class="time-empty">${workerName} aun no tiene marcajes registrados.</td></tr>`;
+      timeLogsTable.innerHTML = `<tr><td colspan="4" class="time-empty">${escapeHTML(workerName)} aun no tiene marcajes registrados.</td></tr>`;
       return;
     }
 
@@ -2557,7 +2647,7 @@ async function loadTimeLogs({ showLoader = true, force = false } = {}){
 
       return `
         <tr>
-          <td>${log.workerName}</td>
+          <td>${escapeHTML(log.workerName || workerName)}</td>
           <td><span class="time-chip time-chip-in">${inFormatted}</span></td>
           <td>${outDate ? `<span class="time-chip time-chip-out">${outFormatted}</span>` : `<span class="time-chip time-chip-pending">${outFormatted}</span>`}</td>
           <td>${status}</td>
